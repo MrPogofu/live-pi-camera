@@ -81,17 +81,26 @@ def init_camera():
 
 def generate_frames():
     """Generate MJPEG frames for streaming"""
-    global stream_active
+    global stream_active, camera
     
-    init_camera()
+    # Try to initialize camera if needed
+    if not stream_active or camera is None:
+        print("Camera not active, initializing...")
+        init_camera()
     
     if not stream_active or camera is None:
         print("Camera not available for streaming")
+        # Return a blank frame to prevent HTML error response
+        blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
+        yield (b'--frame\r\n'
+               b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
+        time.sleep(1)
         return
     
     # Calculate delay based on FPS to limit frame rate
     frame_delay = 1.0 / stream_config['fps']
     last_frame_time = 0
+    error_count = 0
     
     try:
         while True:
@@ -112,17 +121,34 @@ def generate_frames():
                 
                 if not ret:
                     continue
-                    
+                
+                error_count = 0  # Reset error count on success
                 frame_bytes = buffer.tobytes()
                 
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                        
             except Exception as e:
-                print(f"Frame capture error: {e}")
+                error_count += 1
+                print(f"Frame capture error ({error_count}): {e}")
+                
+                # If too many errors, try reinitializing
+                if error_count > 5:
+                    print("Too many frame errors, attempting camera reinit...")
+                    try:
+                        if camera:
+                            camera.stop()
+                            camera.close()
+                    except:
+                        pass
+                    init_camera()
+                    error_count = 0
+                
                 time.sleep(0.1)
                 continue
                 
+    except GeneratorExit:
+        print("Stream client disconnected")
     except Exception as e:
         print(f"Streaming error: {e}")
         stream_active = False
@@ -853,7 +879,7 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then(r => r.json())
+                .then r => r.json())
                 .then(data => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
