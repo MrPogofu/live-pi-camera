@@ -39,31 +39,40 @@ record_config = {
 def init_camera():
     global camera, stream_active
     try:
-        if camera is None:
-            print("Initializing camera...")
-            camera = Picamera2()
-            
-            # Use video configuration with framerate control
-            config = camera.create_video_configuration(
-                main={"size": (stream_config['width'], stream_config['height']), 
-                      "format": "RGB888"},
-                controls={"FrameRate": stream_config['fps']}
-            )
-            
-            print(f"Camera config: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
-            camera.configure(config)
-            
-            # Set auto exposure and auto white balance
-            camera.set_controls({
-                "AeEnable": True,
-                "AwbEnable": True
-            })
-            
-            camera.start()
-            time.sleep(2)
-            
-            stream_active = True
-            print("Camera initialized successfully")
+        # Always stop and release previous camera if exists
+        if camera is not None:
+            try:
+                camera.stop()
+            except Exception as e:
+                print(f"Camera stop error during re-init: {e}")
+            camera = None
+            stream_active = False
+            time.sleep(0.5)  # Give hardware a moment to reset
+
+        print("Initializing camera...")
+        camera = Picamera2()
+        
+        # Use video configuration with framerate control
+        config = camera.create_video_configuration(
+            main={"size": (stream_config['width'], stream_config['height']), 
+                  "format": "RGB888"},
+            controls={"FrameRate": stream_config['fps']}
+        )
+        
+        print(f"Camera config: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
+        camera.configure(config)
+        
+        # Set auto exposure and auto white balance
+        camera.set_controls({
+            "AeEnable": True,
+            "AwbEnable": True
+        })
+        
+        camera.start()
+        time.sleep(2)
+        
+        stream_active = True
+        print("Camera initialized successfully")
     except Exception as e:
         print(f"Error initializing camera: {e}")
         stream_active = False
@@ -199,8 +208,8 @@ def start_recording():
 
 @app.route('/stop_recording', methods=['POST'])
 def stop_recording():
-    global recording
-    
+    global recording, camera
+
     with recording_lock:
         if not recording:
             return jsonify({'status': 'error', 'message': 'Not recording'})
@@ -210,10 +219,14 @@ def stop_recording():
             camera.stop_recording()
             camera.stop()
             recording = False
-            
+
+            # Release camera object before re-initializing
+            camera = None
+            time.sleep(0.5)  # Allow hardware to reset
+
             # Restart camera with streaming configuration
             init_camera()
-            
+
             print("Recording stopped successfully")
             return jsonify({'status': 'success'})
         except Exception as e:
@@ -221,10 +234,15 @@ def stop_recording():
             recording = False
             # Try to recover camera
             try:
-                camera.stop()
+                if camera:
+                    camera.stop()
+            except Exception as e2:
+                print(f"Camera stop error during recovery: {e2}")
+            camera = None
+            try:
                 init_camera()
-            except:
-                pass
+            except Exception as e3:
+                print(f"Camera re-init error during recovery: {e3}")
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/status', methods=['GET'])
@@ -818,7 +836,7 @@ WEB_INTERFACE = '''
         // Check status periodically
         setInterval(() => {
             fetch('/status')
-                .then(r => r.json())
+                .then r => r.json())
                 .then(data => {
                     cameraReady = data.camera_ready;
                     
