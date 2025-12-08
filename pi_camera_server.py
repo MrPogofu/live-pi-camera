@@ -308,7 +308,7 @@ def delete_file(filename):
 
 @app.route('/update_stream_settings', methods=['POST'])
 def update_stream_settings():
-    global stream_config, camera, stream_active
+    global stream_config
     data = request.json
     
     if 'width' in data:
@@ -318,16 +318,8 @@ def update_stream_settings():
     if 'fps' in data:
         stream_config['fps'] = int(data['fps'])
     
-    # Restart camera with new settings if not recording
-    if not recording and camera is not None:
-        try:
-            print(f"Applying stream settings: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
-            camera.stop()
-            stream_active = False
-            time.sleep(0.5)
-            init_camera()
-        except Exception as e:
-            print(f"Error applying stream settings: {e}")
+    print(f"Stream settings updated: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
+    print("Settings will apply on next camera restart")
     
     return jsonify({'status': 'success', 'settings': stream_config})
 
