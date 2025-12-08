@@ -610,15 +610,6 @@ LOGIN_INTERFACE = '''
         .loading.show {
             display: block;
         }
-        .security-notice {
-            background: #1e3a5f;
-            border-left: 4px solid #4CAF50;
-            padding: 12px;
-            border-radius: 6px;
-            margin-top: 20px;
-            font-size: 12px;
-            color: #b0d4ff;
-        }
     </style>
 </head>
 <body>
@@ -648,11 +639,6 @@ LOGIN_INTERFACE = '''
 
         <div class="loading" id="loading">
             Authenticating...
-        </div>
-
-        <div class="security-notice">
-            <strong>🔒 Secure Connection</strong><br>
-            Always use HTTPS when accessing from the internet.
         </div>
     </div>
 
