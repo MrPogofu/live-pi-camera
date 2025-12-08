@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Raspberry Pi Zero Camera Server for FTC Robot
+Install: pip3 install picamera2 flask opencv-python
+Run: python3 camera_server.py
+"""
 
 from flask import Flask, Response, render_template_string, request, jsonify
 from picamera2 import Picamera2
@@ -20,9 +25,9 @@ stream_active = False
 
 # Default settings
 stream_config = {
-    'width': 320,
-    'height': 240,
-    'fps': 24
+    'width': 640,
+    'height': 480,
+    'fps': 30
 }
 
 record_config = {
@@ -172,6 +177,75 @@ def status():
         'record_config': record_config
     })
 
+@app.route('/list_recordings', methods=['GET'])
+def list_recordings():
+    try:
+        video_dir = "/home/pi/videos"
+        if not os.path.exists(video_dir):
+            return jsonify({'status': 'success', 'recordings': []})
+        
+        files = []
+        for filename in os.listdir(video_dir):
+            if filename.endswith('.h264'):
+                filepath = os.path.join(video_dir, filename)
+                size = os.path.getsize(filepath)
+                mtime = os.path.getmtime(filepath)
+                files.append({
+                    'name': filename,
+                    'size': size,
+                    'size_mb': round(size / (1024 * 1024), 2),
+                    'date': datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                })
+        
+        # Sort by date, newest first
+        files.sort(key=lambda x: x['date'], reverse=True)
+        
+        return jsonify({'status': 'success', 'recordings': files})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    try:
+        if recording:
+            return "Cannot download while recording", 400
+        
+        video_dir = "/home/pi/videos"
+        filepath = os.path.join(video_dir, filename)
+        
+        # Security check - ensure filename doesn't contain path traversal
+        if '..' in filename or '/' in filename:
+            return "Invalid filename", 400
+        
+        if not os.path.exists(filepath):
+            return "File not found", 404
+        
+        from flask import send_file
+        return send_file(filepath, as_attachment=True, download_name=filename)
+    except Exception as e:
+        return str(e), 500
+
+@app.route('/delete/<filename>', methods=['POST'])
+def delete_file(filename):
+    try:
+        if recording:
+            return jsonify({'status': 'error', 'message': 'Cannot delete while recording'})
+        
+        video_dir = "/home/pi/videos"
+        filepath = os.path.join(video_dir, filename)
+        
+        # Security check
+        if '..' in filename or '/' in filename:
+            return jsonify({'status': 'error', 'message': 'Invalid filename'})
+        
+        if not os.path.exists(filepath):
+            return jsonify({'status': 'error', 'message': 'File not found'})
+        
+        os.remove(filepath)
+        return jsonify({'status': 'success', 'message': 'File deleted'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
 @app.route('/update_stream_settings', methods=['POST'])
 def update_stream_settings():
     global stream_config
@@ -317,6 +391,70 @@ WEB_INTERFACE = '''
             font-size: 12px;
             margin-top: 5px;
         }
+        .recordings-panel {
+            display: none;
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 10px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .recordings-panel.active { display: block; }
+        .recording-item {
+            background: #2a2a2a;
+            padding: 12px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+        }
+        .recording-name {
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 5px;
+        }
+        .recording-info {
+            font-size: 12px;
+            color: #aaa;
+            margin-bottom: 8px;
+        }
+        .recording-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .download-btn {
+            background: #28a745;
+            color: white;
+            padding: 8px 12px;
+            font-size: 14px;
+            flex: 1;
+        }
+        .download-btn:active { background: #218838; }
+        .download-btn:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .delete-btn {
+            background: #dc3545;
+            color: white;
+            padding: 8px 12px;
+            font-size: 14px;
+            flex: 1;
+        }
+        .delete-btn:active { background: #c82333; }
+        .delete-btn:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .empty-message {
+            text-align: center;
+            color: #aaa;
+            padding: 20px;
+        }
+        .recordings-btn {
+            background: #17a2b8;
+            color: white;
+        }
+        .recordings-btn:active { background: #138496; }
     </style>
 </head>
 <body>
@@ -329,6 +467,9 @@ WEB_INTERFACE = '''
             </button>
             <button class="settings-btn" onclick="toggleSettings()">
                 SETTINGS
+            </button>
+            <button class="recordings-btn" onclick="toggleRecordings()">
+                RECORDINGS
             </button>
         </div>
 
@@ -382,11 +523,39 @@ WEB_INTERFACE = '''
 
             <button class="save-btn" onclick="saveSettings()">SAVE SETTINGS</button>
         </div>
+
+        <div class="recordings-panel" id="recordingsPanel">
+            <h3>Saved Recordings</h3>
+            <div id="recordingsList">
+                <div class="empty-message">Loading recordings...</div>
+            </div>
+        </div>
     </div>
 
     <script>
         let isRecording = false;
         let cameraReady = false;
+
+        // Load current settings on page load
+        function loadCurrentSettings() {
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    // Update stream settings
+                    const streamRes = `${data.stream_config.width},${data.stream_config.height}`;
+                    document.getElementById('streamRes').value = streamRes;
+                    document.getElementById('streamFps').value = data.stream_config.fps;
+                    
+                    // Update record settings
+                    const recordRes = `${data.record_config.width},${data.record_config.height}`;
+                    document.getElementById('recordRes').value = recordRes;
+                    document.getElementById('recordFps').value = data.record_config.fps;
+                })
+                .catch(err => console.log('Failed to load settings:', err));
+        }
+
+        // Load settings when page loads
+        loadCurrentSettings();
 
         function handleStreamError() {
             document.getElementById('status').textContent = 'Status: Camera stream error - refreshing...';
@@ -445,7 +614,98 @@ WEB_INTERFACE = '''
         }
 
         function toggleSettings() {
-            document.getElementById('settingsPanel').classList.toggle('active');
+            const panel = document.getElementById('settingsPanel');
+            const recordingsPanel = document.getElementById('recordingsPanel');
+            
+            // Close recordings if open
+            recordingsPanel.classList.remove('active');
+            
+            panel.classList.toggle('active');
+        }
+
+        function toggleRecordings() {
+            const panel = document.getElementById('recordingsPanel');
+            const settingsPanel = document.getElementById('settingsPanel');
+            
+            // Close settings if open
+            settingsPanel.classList.remove('active');
+            
+            const wasActive = panel.classList.contains('active');
+            panel.classList.toggle('active');
+            
+            // Load recordings when opening
+            if (!wasActive) {
+                loadRecordings();
+            }
+        }
+
+        function loadRecordings() {
+            const list = document.getElementById('recordingsList');
+            list.innerHTML = '<div class="empty-message">Loading recordings...</div>';
+            
+            fetch('/list_recordings')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        if (data.recordings.length === 0) {
+                            list.innerHTML = '<div class="empty-message">No recordings found</div>';
+                        } else {
+                            list.innerHTML = data.recordings.map(rec => `
+                                <div class="recording-item">
+                                    <div class="recording-name">${rec.name}</div>
+                                    <div class="recording-info">
+                                        ${rec.size_mb} MB • ${rec.date}
+                                    </div>
+                                    <div class="recording-actions">
+                                        <button class="download-btn" onclick="downloadRecording('${rec.name}')" 
+                                                ${isRecording ? 'disabled' : ''}>
+                                            DOWNLOAD
+                                        </button>
+                                        <button class="delete-btn" onclick="deleteRecording('${rec.name}')"
+                                                ${isRecording ? 'disabled' : ''}>
+                                            DELETE
+                                        </button>
+                                    </div>
+                                </div>
+                            `).join('');
+                        }
+                    } else {
+                        list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
+                    }
+                })
+                .catch(err => {
+                    list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
+                });
+        }
+
+        function downloadRecording(filename) {
+            if (isRecording) {
+                alert('Cannot download while recording');
+                return;
+            }
+            window.location.href = `/download/${filename}`;
+        }
+
+        function deleteRecording(filename) {
+            if (isRecording) {
+                alert('Cannot delete while recording');
+                return;
+            }
+            
+            if (!confirm(`Delete ${filename}?`)) {
+                return;
+            }
+            
+            fetch(`/delete/${filename}`, { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        loadRecordings(); // Refresh list
+                    } else {
+                        alert('Error: ' + data.message);
+                    }
+                })
+                .catch(err => alert('Error: ' + err));
         }
 
         function saveSettings() {
