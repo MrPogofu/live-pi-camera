@@ -43,11 +43,14 @@ def init_camera():
             print("Initializing camera...")
             camera = Picamera2()
             
-            # Use preview configuration for lower overhead
-            config = camera.create_preview_configuration(
+            # Use video configuration with framerate control
+            config = camera.create_video_configuration(
                 main={"size": (stream_config['width'], stream_config['height']), 
-                      "format": "RGB888"}
+                      "format": "RGB888"},
+                controls={"FrameRate": stream_config['fps']}
             )
+            
+            print(f"Camera config: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
             camera.configure(config)
             
             # Set auto exposure and auto white balance
@@ -75,9 +78,21 @@ def generate_frames():
         print("Camera not available for streaming")
         return
     
+    # Calculate delay based on FPS to limit frame rate
+    frame_delay = 1.0 / stream_config['fps']
+    last_frame_time = 0
+    
     try:
         while True:
             try:
+                # Throttle frame rate
+                current_time = time.time()
+                time_since_last = current_time - last_frame_time
+                if time_since_last < frame_delay:
+                    time.sleep(frame_delay - time_since_last)
+                
+                last_frame_time = time.time()
+                
                 # Capture frame as numpy array
                 frame = camera.capture_array()
                 
@@ -127,13 +142,42 @@ def start_recording():
             os.makedirs("/home/pi/videos", exist_ok=True)
             
             print(f"Starting recording to {filename}")
+            print(f"Recording settings: {record_config['width']}x{record_config['height']} @ {record_config['fps']}fps")
             
-            # Create encoder and output
-            encoder = H264Encoder(bitrate=10000000)  # 10Mbps
+            # Stop current camera and reconfigure for recording
+            camera.stop()
+            
+            # Configure camera with recording settings
+            video_config = camera.create_video_configuration(
+                main={"size": (record_config['width'], record_config['height']), 
+                      "format": "RGB888"},
+                controls={"FrameRate": record_config['fps']}
+            )
+            camera.configure(video_config)
+            
+            # Set auto exposure and white balance
+            camera.set_controls({
+                "AeEnable": True,
+                "AwbEnable": True
+            })
+            
+            camera.start()
+            time.sleep(1)  # Let camera stabilize
+            
+            # Create encoder with appropriate bitrate
+            # Higher resolution needs higher bitrate
+            if record_config['width'] >= 1920:
+                bitrate = 20000000  # 20Mbps for Full HD+
+            elif record_config['width'] >= 1280:
+                bitrate = 15000000  # 15Mbps for HD
+            else:
+                bitrate = 10000000  # 10Mbps for SD
+            
+            encoder = H264Encoder(bitrate=bitrate)
             output = FileOutput(filename)
             
-            # Start recording without reconfiguring camera
-            camera.start_encoder(encoder, output)
+            # Start recording
+            camera.start_recording(encoder, output)
             
             recording = True
             
@@ -145,6 +189,12 @@ def start_recording():
             })
         except Exception as e:
             print(f"Recording start error: {e}")
+            # Try to recover camera for streaming
+            try:
+                camera.stop()
+                init_camera()
+            except:
+                pass
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/stop_recording', methods=['POST'])
@@ -157,14 +207,24 @@ def stop_recording():
         
         try:
             print("Stopping recording")
-            camera.stop_encoder()
+            camera.stop_recording()
+            camera.stop()
             recording = False
+            
+            # Restart camera with streaming configuration
+            init_camera()
             
             print("Recording stopped successfully")
             return jsonify({'status': 'success'})
         except Exception as e:
             print(f"Recording stop error: {e}")
             recording = False
+            # Try to recover camera
+            try:
+                camera.stop()
+                init_camera()
+            except:
+                pass
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/status', methods=['GET'])
@@ -248,7 +308,7 @@ def delete_file(filename):
 
 @app.route('/update_stream_settings', methods=['POST'])
 def update_stream_settings():
-    global stream_config
+    global stream_config, camera, stream_active
     data = request.json
     
     if 'width' in data:
@@ -258,8 +318,18 @@ def update_stream_settings():
     if 'fps' in data:
         stream_config['fps'] = int(data['fps'])
     
-    return jsonify({'status': 'success', 'settings': stream_config, 
-                    'note': 'Restart stream for changes to take effect'})
+    # Restart camera with new settings if not recording
+    if not recording and camera is not None:
+        try:
+            print(f"Applying stream settings: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
+            camera.stop()
+            stream_active = False
+            time.sleep(0.5)
+            init_camera()
+        except Exception as e:
+            print(f"Error applying stream settings: {e}")
+    
+    return jsonify({'status': 'success', 'settings': stream_config})
 
 @app.route('/update_record_settings', methods=['POST'])
 def update_record_settings():
@@ -288,9 +358,12 @@ WEB_INTERFACE = '''
             background: #000;
             color: #fff;
             overflow-x: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         .container {
-            max-width: 100vw;
+            max-width: 720px;
             padding: 10px;
         }
         #stream {
@@ -605,11 +678,16 @@ WEB_INTERFACE = '''
             if (isRecording) {
                 btn.textContent = 'STOP RECORDING';
                 btn.classList.add('recording');
-                status.textContent = 'Status: Recording...';
+                status.textContent = 'Status: Recording... (stream paused)';
             } else {
                 btn.textContent = 'START RECORDING';
                 btn.classList.remove('recording');
                 status.textContent = 'Status: Ready';
+                
+                // Reload stream after recording stops
+                setTimeout(() => {
+                    document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
+                }, 1000);
             }
         }
 
@@ -714,6 +792,10 @@ WEB_INTERFACE = '''
             const recordRes = document.getElementById('recordRes').value.split(',');
             const recordFps = document.getElementById('recordFps').value;
 
+            // Show saving message
+            const status = document.getElementById('status');
+            status.textContent = 'Status: Applying settings...';
+
             fetch('/update_stream_settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -722,6 +804,12 @@ WEB_INTERFACE = '''
                     height: parseInt(streamRes[1]),
                     fps: parseInt(streamFps)
                 })
+            }).then(() => {
+                // Reload stream with new settings
+                setTimeout(() => {
+                    document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
+                    status.textContent = 'Status: Stream settings applied';
+                }, 1500);
             });
 
             fetch('/update_record_settings', {
@@ -733,8 +821,6 @@ WEB_INTERFACE = '''
                     fps: parseInt(recordFps)
                 })
             });
-
-            alert('Settings saved! Refresh page to apply stream changes.');
         }
 
         // Check status periodically
