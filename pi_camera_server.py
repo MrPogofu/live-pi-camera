@@ -83,33 +83,35 @@ def generate_frames():
     """Generate MJPEG frames for streaming"""
     global stream_active, camera
     
-    frame_delay = 1.0 / 30  # Default FPS for fallback
+    # Try to initialize camera if needed
+    if not stream_active or camera is None:
+        print("Camera not active, initializing...")
+        init_camera()
+    
+    if not stream_active or camera is None:
+        print("Camera not available for streaming")
+        # Return a blank frame to prevent HTML error response
+        blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
+        yield (b'--frame\r\n'
+               b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
+        time.sleep(1)
+        return
+    
+    # Calculate delay based on FPS to limit frame rate
+    frame_delay = 1.0 / stream_config['fps']
+    last_frame_time = 0
     error_count = 0
-    last_init_attempt = 0
     
     try:
         while True:
             try:
-                # Try to initialize camera if needed (attempt every 3 seconds)
-                current_time = time.time()
-                if (not stream_active or camera is None) and (current_time - last_init_attempt > 3):
-                    print("Camera not active, initializing...")
-                    init_camera()
-                    last_init_attempt = current_time
-                
-                # If still no camera, yield blank frame and continue loop
-                if not stream_active or camera is None:
-                    blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
-                    time.sleep(1)
-                    continue
-                
-                # Calculate frame delay based on current FPS
-                frame_delay = 1.0 / stream_config['fps']
-                
                 # Throttle frame rate
-                time.sleep(frame_delay)
+                current_time = time.time()
+                time_since_last = current_time - last_frame_time
+                if time_since_last < frame_delay:
+                    time.sleep(frame_delay - time_since_last)
+                
+                last_frame_time = time.time()
                 
                 # Capture frame as numpy array
                 frame = camera.capture_array()
@@ -135,22 +137,14 @@ def generate_frames():
                     print("Too many frame errors, attempting camera reinit...")
                     try:
                         if camera:
-                            try:
-                                camera.stop()
-                            except:
-                                pass
-                            try:
-                                camera.close()
-                            except:
-                                pass
+                            camera.stop()
+                            camera.close()
                     except:
                         pass
-                    global camera
-                    camera = None
                     init_camera()
                     error_count = 0
                 
-                time.sleep(0.5)
+                time.sleep(0.1)
                 continue
                 
     except GeneratorExit:
@@ -724,6 +718,8 @@ WEB_INTERFACE = '''
             fetch('/status')
                 .then(r => r.json())
                 .then(data => {
+                    cameraReady = data.camera_ready;
+                    
                     // Update stream settings
                     const streamRes = `${data.stream_config.width},${data.stream_config.height}`;
                     document.getElementById('streamRes').value = streamRes;
@@ -733,8 +729,33 @@ WEB_INTERFACE = '''
                     const recordRes = `${data.record_config.width},${data.record_config.height}`;
                     document.getElementById('recordRes').value = recordRes;
                     document.getElementById('recordFps').value = data.record_config.fps;
+                    
+                    // Update initial status
+                    updateStatusDisplay(data);
                 })
-                .catch(err => console.log('Failed to load settings:', err));
+                .catch(err => {
+                    console.log('Failed to load settings:', err);
+                    document.getElementById('status').textContent = 'Status: Waiting for camera...';
+                    document.getElementById('status').classList.remove('error');
+                });
+        }
+
+        function updateStatusDisplay(data) {
+            const status = document.getElementById('status');
+            
+            if (data.recording) {
+                status.textContent = 'Status: Recording... (stream paused)';
+                status.classList.remove('error');
+            } else if (data.camera_ready) {
+                status.textContent = 'Status: Ready';
+                status.classList.remove('error');
+            } else if (data.stream_active) {
+                status.textContent = 'Status: Camera initializing...';
+                status.classList.remove('error');
+            } else {
+                status.textContent = 'Status: Waiting for camera...';
+                status.classList.remove('error');
+            }
         }
 
         // Load settings when page loads
@@ -885,7 +906,7 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then r => r.json())
+                .then(r => r.json())
                 .then(data => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
@@ -905,6 +926,7 @@ WEB_INTERFACE = '''
             // Show saving message
             const status = document.getElementById('status');
             status.textContent = 'Status: Applying settings...';
+            status.classList.remove('error');
 
             fetch('/update_stream_settings', {
                 method: 'POST',
@@ -943,19 +965,14 @@ WEB_INTERFACE = '''
                     if (data.recording !== isRecording) {
                         isRecording = data.recording;
                         updateUI();
-                    }
-                    
-                    if (!data.stream_active && !isRecording) {
-                        document.getElementById('status').textContent = 'Status: Camera initializing...';
-                    } else if (cameraReady && !isRecording) {
-                        document.getElementById('status').textContent = 'Status: Ready';
-                        document.getElementById('status').classList.remove('error');
+                    } else if (!isRecording) {
+                        updateStatusDisplay(data);
                     }
                 })
                 .catch(err => {
                     console.log('Status check failed:', err);
                 });
-        }, 2000);
+        }, 1000);
     </script>
 </body>
 </html>
