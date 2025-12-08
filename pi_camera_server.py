@@ -164,7 +164,7 @@ def video_feed():
 
 @app.route('/start_recording', methods=['POST'])
 def start_recording():
-    global recording
+    global recording, camera
     
     with recording_lock:
         if recording:
@@ -906,7 +906,7 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then(r => r.json())
+                .then r => r.json())
                 .then(data => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
