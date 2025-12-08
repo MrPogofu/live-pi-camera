@@ -83,35 +83,33 @@ def generate_frames():
     """Generate MJPEG frames for streaming"""
     global stream_active, camera
     
-    # Try to initialize camera if needed
-    if not stream_active or camera is None:
-        print("Camera not active, initializing...")
-        init_camera()
-    
-    if not stream_active or camera is None:
-        print("Camera not available for streaming")
-        # Return a blank frame to prevent HTML error response
-        blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
-        yield (b'--frame\r\n'
-               b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
-        time.sleep(1)
-        return
-    
-    # Calculate delay based on FPS to limit frame rate
-    frame_delay = 1.0 / stream_config['fps']
-    last_frame_time = 0
+    frame_delay = 1.0 / 30  # Default FPS for fallback
     error_count = 0
+    last_init_attempt = 0
     
     try:
         while True:
             try:
-                # Throttle frame rate
+                # Try to initialize camera if needed (attempt every 3 seconds)
                 current_time = time.time()
-                time_since_last = current_time - last_frame_time
-                if time_since_last < frame_delay:
-                    time.sleep(frame_delay - time_since_last)
+                if (not stream_active or camera is None) and (current_time - last_init_attempt > 3):
+                    print("Camera not active, initializing...")
+                    init_camera()
+                    last_init_attempt = current_time
                 
-                last_frame_time = time.time()
+                # If still no camera, yield blank frame and continue loop
+                if not stream_active or camera is None:
+                    blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
+                    time.sleep(1)
+                    continue
+                
+                # Calculate frame delay based on current FPS
+                frame_delay = 1.0 / stream_config['fps']
+                
+                # Throttle frame rate
+                time.sleep(frame_delay)
                 
                 # Capture frame as numpy array
                 frame = camera.capture_array()
@@ -137,14 +135,22 @@ def generate_frames():
                     print("Too many frame errors, attempting camera reinit...")
                     try:
                         if camera:
-                            camera.stop()
-                            camera.close()
+                            try:
+                                camera.stop()
+                            except:
+                                pass
+                            try:
+                                camera.close()
+                            except:
+                                pass
                     except:
                         pass
+                    global camera
+                    camera = None
                     init_camera()
                     error_count = 0
                 
-                time.sleep(0.1)
+                time.sleep(0.5)
                 continue
                 
     except GeneratorExit:
