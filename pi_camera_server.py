@@ -906,7 +906,7 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then r => r.json())
+                .then(r => r.json())
                 .then(data => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
