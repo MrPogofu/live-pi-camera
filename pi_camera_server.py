@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
+
 from flask import Flask, Response, render_template_string, request, jsonify
 from picamera2 import Picamera2
-from picamera2.encoders import H264Encoder, Quality
+from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
-import io
 import time
 import threading
 from datetime import datetime
 import os
+import cv2
 
 app = Flask(__name__)
 
@@ -15,14 +16,13 @@ app = Flask(__name__)
 camera = None
 recording = False
 recording_lock = threading.Lock()
-current_encoder = None
-current_output = None
+stream_active = False
 
-# Default settings for Waveshare Night Vision Camera (IMX335 5MP)
+# Default settings
 stream_config = {
-    'width': 640,
-    'height': 480,
-    'fps': 30
+    'width': 320,
+    'height': 240,
+    'fps': 24
 }
 
 record_config = {
@@ -31,95 +31,70 @@ record_config = {
     'fps': 30
 }
 
-# Camera tuning parameters
-camera_tuning = {
-    'exposure': 10000,      # microseconds (adjustable for lighting)
-    'gain': 2.0,            # Analog gain (1.0-8.0, higher for low light)
-    'awb_mode': 'auto',     # Auto white balance
-    'brightness': 0.0,      # -1.0 to 1.0
-    'contrast': 1.0,        # 0.0 to 2.0
-    'auto_exposure': True,  # Auto exposure control
-    'auto_gain': True       # Auto gain control
-}
-
-class StreamingOutput(io.BufferedIOBase):
-    def __init__(self):
-        self.frame = None
-        self.condition = threading.Condition()
-
-    def write(self, buf):
-        with self.condition:
-            self.frame = buf
-            self.condition.notify_all()
-
-def apply_camera_controls():
-    """Apply camera control settings based on auto/manual modes"""
-    if camera is None:
-        return
-        
-    controls = {}
-    
-    if camera_tuning['auto_exposure'] and camera_tuning['auto_gain']:
-        # Use auto exposure and gain together
-        controls["AeEnable"] = True
-        controls["AeExposureMode"] = 0  # Normal exposure mode
-    elif not camera_tuning['auto_exposure'] and not camera_tuning['auto_gain']:
-        # Full manual mode
-        controls["AeEnable"] = False
-        controls["ExposureTime"] = camera_tuning['exposure']
-        controls["AnalogueGain"] = camera_tuning['gain']
-    elif not camera_tuning['auto_exposure']:
-        # Manual exposure, auto gain
-        controls["AeEnable"] = False
-        controls["ExposureTime"] = camera_tuning['exposure']
-        # Note: Can't have auto gain without auto exposure in libcamera
-    else:
-        # Auto exposure, manual gain (limited support)
-        controls["AeEnable"] = True
-        # Manual gain override may not work well with AE enabled
-    
-    # Always apply these
-    controls["Brightness"] = camera_tuning['brightness']
-    controls["Contrast"] = camera_tuning['contrast']
-    controls["AwbEnable"] = True  # Keep auto white balance on
-    
-    try:
-        camera.set_controls(controls)
-    except Exception as e:
-        print(f"Error setting camera controls: {e}")
-
 def init_camera():
-    global camera
-    if camera is None:
-        camera = Picamera2()
-        # Configure for streaming with IMX335 5MP sensor settings
-        config = camera.create_video_configuration(
-            main={"size": (stream_config['width'], stream_config['height']), 
-                  "format": "RGB888"},
-            controls={
-                "FrameRate": stream_config['fps'],
-                "ExposureTime": 10000,  # Adjust for lighting conditions
-                "AnalogueGain": 2.0     # Boost for low light
-            }
-        )
-        camera.configure(config)
-        camera.start()
-        time.sleep(2)  # Camera warm-up for IMX335
+    global camera, stream_active
+    try:
+        if camera is None:
+            print("Initializing camera...")
+            camera = Picamera2()
+            
+            # Use preview configuration for lower overhead
+            config = camera.create_preview_configuration(
+                main={"size": (stream_config['width'], stream_config['height']), 
+                      "format": "RGB888"}
+            )
+            camera.configure(config)
+            
+            # Set auto exposure and auto white balance
+            camera.set_controls({
+                "AeEnable": True,
+                "AwbEnable": True
+            })
+            
+            camera.start()
+            time.sleep(2)
+            
+            stream_active = True
+            print("Camera initialized successfully")
+    except Exception as e:
+        print(f"Error initializing camera: {e}")
+        stream_active = False
 
 def generate_frames():
     """Generate MJPEG frames for streaming"""
+    global stream_active
+    
     init_camera()
     
-    while True:
-        frame = camera.capture_array()
-        
-        # Convert to JPEG
-        import cv2
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        frame_bytes = buffer.tobytes()
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    if not stream_active or camera is None:
+        print("Camera not available for streaming")
+        return
+    
+    try:
+        while True:
+            try:
+                # Capture frame as numpy array
+                frame = camera.capture_array()
+                
+                # Encode to JPEG with quality 70 for balance
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                
+                if not ret:
+                    continue
+                    
+                frame_bytes = buffer.tobytes()
+                
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                       
+            except Exception as e:
+                print(f"Frame capture error: {e}")
+                time.sleep(0.1)
+                continue
+                
+    except Exception as e:
+        print(f"Streaming error: {e}")
+        stream_active = False
 
 @app.route('/')
 def index():
@@ -132,106 +107,70 @@ def video_feed():
 
 @app.route('/start_recording', methods=['POST'])
 def start_recording():
-    global recording, current_encoder, current_output
+    global recording
     
     with recording_lock:
         if recording:
             return jsonify({'status': 'error', 'message': 'Already recording'})
         
+        if camera is None:
+            return jsonify({'status': 'error', 'message': 'Camera not initialized'})
+        
         try:
-            # Create filename with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"/home/pi/videos/video_{timestamp}.h264"
-            
-            # Ensure directory exists
             os.makedirs("/home/pi/videos", exist_ok=True)
             
-            # Reconfigure camera for recording with IMX335 settings
-            config = camera.create_video_configuration(
-                main={"size": (record_config['width'], record_config['height'])},
-                controls={"FrameRate": record_config['fps']}
-            )
-            camera.configure(config)
+            print(f"Starting recording to {filename}")
             
-            # Apply camera controls
-            apply_camera_controls()
-            
-            # Start recording
-            encoder = H264Encoder()
+            # Create encoder and output
+            encoder = H264Encoder(bitrate=10000000)  # 10Mbps
             output = FileOutput(filename)
-            camera.start_recording(encoder, output)
             
-            current_encoder = encoder
-            current_output = output
+            # Start recording without reconfiguring camera
+            camera.start_encoder(encoder, output)
+            
             recording = True
             
+            print("Recording started successfully")
             return jsonify({
                 'status': 'success',
                 'filename': filename,
                 'settings': record_config
             })
         except Exception as e:
+            print(f"Recording start error: {e}")
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/stop_recording', methods=['POST'])
 def stop_recording():
-    global recording, current_encoder, current_output
+    global recording
     
     with recording_lock:
         if not recording:
             return jsonify({'status': 'error', 'message': 'Not recording'})
         
         try:
-            camera.stop_recording()
+            print("Stopping recording")
+            camera.stop_encoder()
             recording = False
-            current_encoder = None
-            current_output = None
             
-            # Reconfigure back to streaming with IMX335 settings
-            config = camera.create_video_configuration(
-                main={"size": (stream_config['width'], stream_config['height'])},
-                controls={"FrameRate": stream_config['fps']}
-            )
-            camera.configure(config)
-            
-            # Apply camera controls
-            apply_camera_controls()
-            
+            print("Recording stopped successfully")
             return jsonify({'status': 'success'})
         except Exception as e:
+            print(f"Recording stop error: {e}")
+            recording = False
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/status', methods=['GET'])
 def status():
     return jsonify({
         'recording': recording,
+        'stream_active': stream_active,
+        'camera_ready': camera is not None,
         'stream_config': stream_config,
         'record_config': record_config
     })
-
-@app.route('/update_camera_tuning', methods=['POST'])
-def update_camera_tuning():
-    global camera_tuning
-    data = request.json
-    
-    if 'exposure' in data:
-        camera_tuning['exposure'] = int(data['exposure'])
-    if 'gain' in data:
-        camera_tuning['gain'] = float(data['gain'])
-    if 'brightness' in data:
-        camera_tuning['brightness'] = float(data['brightness'])
-    if 'contrast' in data:
-        camera_tuning['contrast'] = float(data['contrast'])
-    if 'auto_exposure' in data:
-        camera_tuning['auto_exposure'] = bool(data['auto_exposure'])
-    if 'auto_gain' in data:
-        camera_tuning['auto_gain'] = bool(data['auto_gain'])
-    
-    # Apply settings to camera
-    if camera and not recording:
-        apply_camera_controls()
-    
-    return jsonify({'status': 'success', 'tuning': camera_tuning})
 
 @app.route('/update_stream_settings', methods=['POST'])
 def update_stream_settings():
@@ -245,12 +184,8 @@ def update_stream_settings():
     if 'fps' in data:
         stream_config['fps'] = int(data['fps'])
     
-    # Restart camera with new settings if not recording
-    if not recording:
-        camera.stop()
-        init_camera()
-    
-    return jsonify({'status': 'success', 'settings': stream_config})
+    return jsonify({'status': 'success', 'settings': stream_config, 
+                    'note': 'Restart stream for changes to take effect'})
 
 @app.route('/update_record_settings', methods=['POST'])
 def update_record_settings():
@@ -290,6 +225,8 @@ WEB_INTERFACE = '''
             display: block;
             border: 2px solid #333;
             border-radius: 8px;
+            background: #1a1a1a;
+            min-height: 240px;
         }
         .controls {
             margin-top: 15px;
@@ -315,6 +252,10 @@ WEB_INTERFACE = '''
             background: #28a745;
             animation: pulse 1.5s infinite;
         }
+        .record-btn:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.7; }
@@ -330,6 +271,9 @@ WEB_INTERFACE = '''
             border-radius: 8px;
             margin-top: 10px;
             font-size: 14px;
+        }
+        .status.error {
+            background: #dc3545;
         }
         .settings-panel {
             display: none;
@@ -348,7 +292,7 @@ WEB_INTERFACE = '''
             font-size: 14px;
             color: #aaa;
         }
-        .setting-group select, .setting-group input {
+        .setting-group select {
             width: 100%;
             padding: 10px;
             background: #2a2a2a;
@@ -356,66 +300,6 @@ WEB_INTERFACE = '''
             border-radius: 5px;
             color: #fff;
             font-size: 14px;
-        }
-        .toggle-container {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 15px;
-            padding: 12px;
-            background: #2a2a2a;
-            border-radius: 5px;
-        }
-        .toggle-label {
-            font-size: 14px;
-            color: #fff;
-        }
-        .toggle-switch {
-            position: relative;
-            width: 50px;
-            height: 26px;
-        }
-        .toggle-switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-        .toggle-slider {
-            position: absolute;
-            cursor: pointer;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background-color: #555;
-            transition: 0.3s;
-            border-radius: 26px;
-        }
-        .toggle-slider:before {
-            position: absolute;
-            content: "";
-            height: 20px;
-            width: 20px;
-            left: 3px;
-            bottom: 3px;
-            background-color: white;
-            transition: 0.3s;
-            border-radius: 50%;
-        }
-        .toggle-switch input:checked + .toggle-slider {
-            background-color: #4CAF50;
-        }
-        .toggle-switch input:checked + .toggle-slider:before {
-            transform: translateX(24px);
-        }
-        .manual-controls {
-            opacity: 0.5;
-            pointer-events: none;
-            transition: opacity 0.3s;
-        }
-        .manual-controls.active {
-            opacity: 1;
-            pointer-events: auto;
         }
         h3 {
             color: #4CAF50;
@@ -428,11 +312,16 @@ WEB_INTERFACE = '''
             width: 100%;
         }
         .save-btn:active { background: #0056b3; }
+        .info-text {
+            color: #aaa;
+            font-size: 12px;
+            margin-top: 5px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream">
+        <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
         
         <div class="controls">
             <button id="recordBtn" class="record-btn" onclick="toggleRecording()">
@@ -444,7 +333,7 @@ WEB_INTERFACE = '''
         </div>
 
         <div class="status" id="status">
-            Status: Ready
+            Status: Connecting...
         </div>
 
         <div class="settings-panel" id="settingsPanel">
@@ -452,10 +341,11 @@ WEB_INTERFACE = '''
             <div class="setting-group">
                 <label>Resolution</label>
                 <select id="streamRes">
-                    <option value="320,240">320x240 (Low)</option>
-                    <option value="640,480" selected>640x480 (Medium)</option>
-                    <option value="800,600">800x600 (High)</option>
+                    <option value="320,240">320x240 (Low Latency)</option>
+                    <option value="640,480" selected>640x480 (Balanced)</option>
+                    <option value="800,600">800x600 (High Quality)</option>
                 </select>
+                <div class="info-text">Lower resolution = less latency</div>
             </div>
             <div class="setting-group">
                 <label>FPS</label>
@@ -470,11 +360,12 @@ WEB_INTERFACE = '''
             <div class="setting-group">
                 <label>Resolution</label>
                 <select id="recordRes">
-                    <option value="640,480">640x480</option>
+                    <option value="640,480">640x480 (SD)</option>
                     <option value="1280,720">1280x720 (HD)</option>
                     <option value="1920,1080" selected>1920x1080 (Full HD)</option>
                     <option value="2592,1944">2592x1944 (5MP Max)</option>
                 </select>
+                <div class="info-text">Recording resolution (independent of stream)</div>
             </div>
             <div class="setting-group">
                 <label>FPS</label>
@@ -485,45 +376,8 @@ WEB_INTERFACE = '''
                 </select>
             </div>
 
-            <h3 style="margin-top: 20px;">Camera Tuning (Night Vision)</h3>
-            
-            <div class="toggle-container">
-                <span class="toggle-label">Auto Exposure</span>
-                <label class="toggle-switch">
-                    <input type="checkbox" id="autoExposure" checked onchange="toggleAutoControls()">
-                    <span class="toggle-slider"></span>
-                </label>
-            </div>
-            
-            <div id="exposureControls" class="manual-controls">
-                <div class="setting-group">
-                    <label>Exposure Time: <span id="exposureVal">10000</span>µs</label>
-                    <input type="range" id="exposure" min="1000" max="100000" value="10000" step="1000">
-                </div>
-            </div>
-            
-            <div class="toggle-container">
-                <span class="toggle-label">Auto Gain</span>
-                <label class="toggle-switch">
-                    <input type="checkbox" id="autoGain" checked onchange="toggleAutoControls()">
-                    <span class="toggle-slider"></span>
-                </label>
-            </div>
-            
-            <div id="gainControls" class="manual-controls">
-                <div class="setting-group">
-                    <label>Gain: <span id="gainVal">2.0</span>x</label>
-                    <input type="range" id="gain" min="1" max="8" value="2" step="0.1">
-                </div>
-            </div>
-            
-            <div class="setting-group">
-                <label>Brightness: <span id="brightnessVal">0.0</span></label>
-                <input type="range" id="brightness" min="-1" max="1" value="0" step="0.1">
-            </div>
-            <div class="setting-group">
-                <label>Contrast: <span id="contrastVal">1.0</span></label>
-                <input type="range" id="contrast" min="0" max="2" value="1" step="0.1">
+            <div class="info-text" style="margin: 15px 0;">
+                Camera uses automatic exposure and white balance for best quality.
             </div>
 
             <button class="save-btn" onclick="saveSettings()">SAVE SETTINGS</button>
@@ -532,72 +386,61 @@ WEB_INTERFACE = '''
 
     <script>
         let isRecording = false;
+        let cameraReady = false;
 
-        // Update slider value displays
-        document.getElementById('exposure').oninput = function() {
-            document.getElementById('exposureVal').textContent = this.value;
-        };
-        document.getElementById('gain').oninput = function() {
-            document.getElementById('gainVal').textContent = parseFloat(this.value).toFixed(1);
-        };
-        document.getElementById('brightness').oninput = function() {
-            document.getElementById('brightnessVal').textContent = parseFloat(this.value).toFixed(1);
-        };
-        document.getElementById('contrast').oninput = function() {
-            document.getElementById('contrastVal').textContent = parseFloat(this.value).toFixed(1);
-        };
-
-        // Toggle manual controls based on auto settings
-        function toggleAutoControls() {
-            const autoExposure = document.getElementById('autoExposure').checked;
-            const autoGain = document.getElementById('autoGain').checked;
-            
-            const exposureControls = document.getElementById('exposureControls');
-            const gainControls = document.getElementById('gainControls');
-            
-            if (autoExposure) {
-                exposureControls.classList.remove('active');
-            } else {
-                exposureControls.classList.add('active');
-            }
-            
-            if (autoGain) {
-                gainControls.classList.remove('active');
-            } else {
-                gainControls.classList.add('active');
-            }
+        function handleStreamError() {
+            document.getElementById('status').textContent = 'Status: Camera stream error - refreshing...';
+            document.getElementById('status').classList.add('error');
+            setTimeout(() => {
+                document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
+            }, 2000);
         }
 
-        // Initialize toggle states on load
-        toggleAutoControls();
-
         function toggleRecording() {
+            if (!cameraReady) {
+                alert('Camera not ready. Please wait...');
+                return;
+            }
+
             const btn = document.getElementById('recordBtn');
+            btn.disabled = true;
+            
             const url = isRecording ? '/stop_recording' : '/start_recording';
             
             fetch(url, { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
+                    btn.disabled = false;
                     if (data.status === 'success') {
                         isRecording = !isRecording;
                         updateUI();
                     } else {
                         alert('Error: ' + data.message);
+                        document.getElementById('status').textContent = 'Status: Error - ' + data.message;
+                        document.getElementById('status').classList.add('error');
                     }
                 })
-                .catch(err => alert('Error: ' + err));
+                .catch(err => {
+                    btn.disabled = false;
+                    alert('Error: ' + err);
+                    document.getElementById('status').textContent = 'Status: Connection error';
+                    document.getElementById('status').classList.add('error');
+                });
         }
 
         function updateUI() {
             const btn = document.getElementById('recordBtn');
+            const status = document.getElementById('status');
+            status.classList.remove('error');
+            
             if (isRecording) {
                 btn.textContent = 'STOP RECORDING';
                 btn.classList.add('recording');
-                document.getElementById('status').textContent = 'Status: Recording...';
+                status.textContent = 'Status: Recording...';
             } else {
                 btn.textContent = 'START RECORDING';
                 btn.classList.remove('recording');
-                document.getElementById('status').textContent = 'Status: Ready';
+                status.textContent = 'Status: Ready';
             }
         }
 
@@ -610,20 +453,6 @@ WEB_INTERFACE = '''
             const streamFps = document.getElementById('streamFps').value;
             const recordRes = document.getElementById('recordRes').value.split(',');
             const recordFps = document.getElementById('recordFps').value;
-
-            // Update camera tuning
-            fetch('/update_camera_tuning', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    exposure: parseInt(document.getElementById('exposure').value),
-                    gain: parseFloat(document.getElementById('gain').value),
-                    brightness: parseFloat(document.getElementById('brightness').value),
-                    contrast: parseFloat(document.getElementById('contrast').value),
-                    auto_exposure: document.getElementById('autoExposure').checked,
-                    auto_gain: document.getElementById('autoGain').checked
-                })
-            });
 
             fetch('/update_stream_settings', {
                 method: 'POST',
@@ -645,18 +474,30 @@ WEB_INTERFACE = '''
                 })
             });
 
-            alert('Settings saved! Camera controls updated.');
+            alert('Settings saved! Refresh page to apply stream changes.');
         }
 
-        // Check recording status periodically
+        // Check status periodically
         setInterval(() => {
             fetch('/status')
                 .then(r => r.json())
                 .then(data => {
+                    cameraReady = data.camera_ready;
+                    
                     if (data.recording !== isRecording) {
                         isRecording = data.recording;
                         updateUI();
                     }
+                    
+                    if (!data.stream_active && !isRecording) {
+                        document.getElementById('status').textContent = 'Status: Camera initializing...';
+                    } else if (cameraReady && !isRecording) {
+                        document.getElementById('status').textContent = 'Status: Ready';
+                        document.getElementById('status').classList.remove('error');
+                    }
+                })
+                .catch(err => {
+                    console.log('Status check failed:', err);
                 });
         }, 2000);
     </script>
@@ -667,4 +508,11 @@ WEB_INTERFACE = '''
 if __name__ == '__main__':
     print("Starting FTC Robot Camera Server...")
     print("Access from phone: http://<raspberry-pi-ip>:8080")
-    app.run(host='0.0.0.0', port=8080, threaded=True)
+    print("Press Ctrl+C to stop")
+    try:
+        app.run(host='0.0.0.0', port=8080, threaded=True, debug=False)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        if camera:
+            camera.stop()
+        print("Server stopped")
