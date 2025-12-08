@@ -5,17 +5,27 @@ Install: pip3 install picamera2 flask opencv-python
 Run: python3 camera_server.py
 """
 
-from flask import Flask, Response, render_template_string, request, jsonify
+from flask import Flask, Response, render_template_string, request, jsonify, session, redirect, url_for
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
+from werkzeug.security import generate_password_hash, check_password_hash
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import cv2
+import secrets
 
 app = Flask(__name__)
+
+# Production security settings
+app.secret_key = secrets.token_hex(32)
+app.config['SESSION_COOKIE_SECURE'] = True  # Only send over HTTPS
+app.config['SESSION_COOKIE_HTTPONLY'] = True  # Not accessible from JavaScript
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
+app.config['SESSION_REFRESH_EACH_REQUEST'] = True
 
 # Global variables
 camera = None
@@ -35,6 +45,74 @@ record_config = {
     'height': 1080,
     'fps': 30
 }
+
+# Production credentials - change username and password!
+# Generate hash: python3 -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('your_password'))"
+CREDENTIALS = {
+    'admin': generate_password_hash('gary2026')
+}
+
+# Rate limiting for login attempts
+login_attempts = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_ATTEMPT_WINDOW = 300  # 5 minutes
+
+def cleanup_old_attempts():
+    """Remove old login attempt records"""
+    current_time = time.time()
+    expired = [ip for ip, data in login_attempts.items() 
+               if current_time - data['first_attempt'] > LOGIN_ATTEMPT_WINDOW]
+    for ip in expired:
+        del login_attempts[ip]
+
+def check_rate_limit(ip):
+    """Check if IP has exceeded login attempts"""
+    cleanup_old_attempts()
+    
+    if ip not in login_attempts:
+        login_attempts[ip] = {'count': 0, 'first_attempt': time.time()}
+    
+    data = login_attempts[ip]
+    if time.time() - data['first_attempt'] > LOGIN_ATTEMPT_WINDOW:
+        login_attempts[ip] = {'count': 0, 'first_attempt': time.time()}
+        data = login_attempts[ip]
+    
+    if data['count'] >= MAX_LOGIN_ATTEMPTS:
+        return False
+    
+    return True
+
+def increment_failed_attempt(ip):
+    """Track failed login attempt"""
+    if ip not in login_attempts:
+        login_attempts[ip] = {'count': 0, 'first_attempt': time.time()}
+    login_attempts[ip]['count'] += 1
+
+def reset_login_attempts(ip):
+    """Clear login attempts for IP"""
+    if ip in login_attempts:
+        del login_attempts[ip]
+
+def require_login(f):
+    """Decorator to require login for routes"""
+    def decorated_function(*args, **kwargs):
+        if 'user' not in session:
+            return jsonify({'status': 'error', 'message': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    decorated_function.__name__ = f.__name__
+    return decorated_function
+
+@app.before_request
+def security_headers():
+    """Add security headers to responses"""
+    @app.after_request
+    def set_security_headers(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'unsafe-inline'"
+        return response
 
 def init_camera():
     global camera, stream_active
@@ -153,16 +231,58 @@ def generate_frames():
         print(f"Streaming error: {e}")
         stream_active = False
 
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    client_ip = request.remote_addr
+    
+    # Rate limiting check
+    if not check_rate_limit(client_ip):
+        print(f"Login rate limit exceeded for IP: {client_ip}")
+        return jsonify({'status': 'error', 'message': 'Too many login attempts. Try again later.'}), 429
+    
+    # Input validation
+    if not username or not password:
+        increment_failed_attempt(client_ip)
+        return jsonify({'status': 'error', 'message': 'Missing credentials'}), 400
+    
+    # Check credentials
+    if username in CREDENTIALS and check_password_hash(CREDENTIALS[username], password):
+        reset_login_attempts(client_ip)
+        session.permanent = True
+        session['user'] = username
+        session['login_time'] = datetime.now().isoformat()
+        print(f"Successful login for user: {username} from IP: {client_ip}")
+        return jsonify({'status': 'success', 'message': 'Logged in'})
+    else:
+        increment_failed_attempt(client_ip)
+        print(f"Failed login attempt for user: {username} from IP: {client_ip}")
+        return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    username = session.get('user', 'Unknown')
+    client_ip = request.remote_addr
+    print(f"User {username} logged out from IP: {client_ip}")
+    session.clear()
+    return jsonify({'status': 'success', 'message': 'Logged out'})
+
 @app.route('/')
 def index():
+    if 'user' not in session:
+        return render_template_string(LOGIN_INTERFACE)
     return render_template_string(WEB_INTERFACE)
 
 @app.route('/video_feed')
+@require_login
 def video_feed():
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/start_recording', methods=['POST'])
+@require_login
 def start_recording():
     global recording, camera
     
@@ -272,6 +392,7 @@ def start_recording():
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/stop_recording', methods=['POST'])
+@require_login
 def stop_recording():
     global recording, camera
 
@@ -340,6 +461,7 @@ def stop_recording():
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/status', methods=['GET'])
+@require_login
 def status():
     return jsonify({
         'recording': recording,
@@ -350,6 +472,7 @@ def status():
     })
 
 @app.route('/list_recordings', methods=['GET'])
+@require_login
 def list_recordings():
     try:
         video_dir = "/home/pi/videos"
@@ -377,6 +500,7 @@ def list_recordings():
         return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/download/<filename>')
+@require_login
 def download_file(filename):
     try:
         if recording:
@@ -398,6 +522,7 @@ def download_file(filename):
         return str(e), 500
 
 @app.route('/delete/<filename>', methods=['POST'])
+@require_login
 def delete_file(filename):
     try:
         if recording:
@@ -419,6 +544,7 @@ def delete_file(filename):
         return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/update_stream_settings', methods=['POST'])
+@require_login
 def update_stream_settings():
     global stream_config
     data = request.json
@@ -436,6 +562,7 @@ def update_stream_settings():
     return jsonify({'status': 'success', 'settings': stream_config})
 
 @app.route('/update_record_settings', methods=['POST'])
+@require_login
 def update_record_settings():
     global record_config
     data = request.json
@@ -449,12 +576,261 @@ def update_record_settings():
     
     return jsonify({'status': 'success', 'settings': record_config})
 
+LOGIN_INTERFACE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FTC Robot Camera - Login</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-container {
+            background: #1a1a1a;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+            width: 100%;
+            max-width: 360px;
+            border: 1px solid #333;
+        }
+        .login-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .login-header h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+            color: #4CAF50;
+        }
+        .login-header p {
+            color: #888;
+            font-size: 14px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #aaa;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 12px;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 16px;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        .login-btn {
+            width: 100%;
+            padding: 12px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .login-btn:hover:not(:disabled) {
+            background: #45a049;
+        }
+        .login-btn:active:not(:disabled) {
+            background: #3d8b40;
+        }
+        .login-btn:disabled {
+            background: #666;
+            cursor: not-allowed;
+            opacity: 0.7;
+        }
+        .error-message {
+            display: none;
+            background: #dc3545;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            word-wrap: break-word;
+        }
+        .error-message.show {
+            display: block;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            color: #888;
+            font-size: 14px;
+        }
+        .loading.show {
+            display: block;
+        }
+        .security-notice {
+            background: #1e3a5f;
+            border-left: 4px solid #4CAF50;
+            padding: 12px;
+            border-radius: 6px;
+            margin-top: 20px;
+            font-size: 12px;
+            color: #b0d4ff;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-header">
+            <h1>🎥 Camera</h1>
+            <p>FTC Robot Camera Server</p>
+        </div>
+
+        <div class="error-message" id="errorMsg"></div>
+
+        <form id="loginForm" onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required autofocus autocomplete="username">
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required autocomplete="current-password">
+            </div>
+
+            <button type="submit" class="login-btn" id="loginBtn">
+                Sign In
+            </button>
+        </form>
+
+        <div class="loading" id="loading">
+            Authenticating...
+        </div>
+
+        <div class="security-notice">
+            <strong>🔒 Secure Connection</strong><br>
+            This server requires HTTPS when accessed over the internet.
+        </div>
+    </div>
+
+    <script>
+        let loginAttempts = 0;
+        const MAX_CLIENT_ATTEMPTS = 5;
+
+        function handleLogin(event) {
+            event.preventDefault();
+
+            // Client-side rate limiting
+            if (loginAttempts >= MAX_CLIENT_ATTEMPTS) {
+                showError('Too many login attempts. Please wait before trying again.');
+                return;
+            }
+
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+            const btn = document.getElementById('loginBtn');
+            const errorMsg = document.getElementById('errorMsg');
+            const loading = document.getElementById('loading');
+
+            // Basic validation
+            if (!username || !password) {
+                showError('Username and password are required');
+                return;
+            }
+
+            btn.disabled = true;
+            loading.classList.add('show');
+            errorMsg.classList.remove('show');
+
+            fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            })
+            .then(r => {
+                if (r.status === 429) {
+                    throw new Error('Too many login attempts. Try again later.');
+                }
+                return r.json();
+            })
+            .then(data => {
+                if (data.status === 'success') {
+                    // Redirect on successful login
+                    window.location.href = '/';
+                } else {
+                    loginAttempts++;
+                    showError(data.message || 'Login failed');
+                    btn.disabled = false;
+                    loading.classList.remove('show');
+                    document.getElementById('password').value = '';
+                    document.getElementById('password').focus();
+                }
+            })
+            .catch(err => {
+                loginAttempts++;
+                showError(err.message || 'Connection error');
+                btn.disabled = false;
+                loading.classList.remove('show');
+            });
+        }
+
+        function showError(message) {
+            const errorMsg = document.getElementById('errorMsg');
+            errorMsg.textContent = message;
+            errorMsg.classList.add('show');
+        }
+
+        // Auto-focus password when username is complete
+        document.getElementById('username').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                document.getElementById('password').focus();
+            }
+        });
+
+        document.getElementById('password').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                document.getElementById('loginForm').dispatchEvent(new Event('submit'));
+            }
+        });
+
+        // Clear error on input
+        document.getElementById('username').addEventListener('input', function() {
+            document.getElementById('errorMsg').classList.remove('show');
+        });
+        document.getElementById('password').addEventListener('input', function() {
+            document.getElementById('errorMsg').classList.remove('show');
+        });
+    </script>
+</body>
+</html>
+'''
+
 WEB_INTERFACE = '''
 <!DOCTYPE html>
 <html>
 <head>
     <title>FTC Robot Camera</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -469,6 +845,7 @@ WEB_INTERFACE = '''
         .container {
             max-width: 720px;
             padding: 10px;
+            position: relative;
         }
         #stream {
             width: 100%;
@@ -632,10 +1009,32 @@ WEB_INTERFACE = '''
             color: white;
         }
         .recordings-btn:active { background: #138496; }
+        .logout-btn {
+            background: #dc3545;
+            color: white;
+            font-size: 14px;
+            padding: 10px 15px;
+            position: absolute;
+            top: 10px;
+            right: 10px;
+        }
+        .logout-btn:active { background: #c82333; }
+        .user-info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #aaa;
+            font-size: 12px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
+        <div class="user-info">
+            Logged in as <strong id="username">User</strong>
+        </div>
+        <button class="logout-btn" onclick="logout()">LOGOUT</button>
+
         <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
         
         <div class="controls">
@@ -955,6 +1354,25 @@ WEB_INTERFACE = '''
             });
         }
 
+        function logout() {
+            if (!confirm('Logout?')) {
+                return;
+            }
+            
+            fetch('/logout', { method: 'POST' })
+                .then(() => {
+                    // Clear session and redirect
+                    window.location.href = '/';
+                })
+                .catch(err => {
+                    console.error('Logout error:', err);
+                    window.location.href = '/';
+                });
+        }
+
+        // Display username from session
+        document.getElementById('username').textContent = 'User';
+
         // Check status periodically
         setInterval(() => {
             fetch('/status')
@@ -980,6 +1398,14 @@ WEB_INTERFACE = '''
 
 if __name__ == '__main__':
     print("Starting FTC Robot Camera Server...")
+    print("=" * 50)
+    print("SECURITY NOTICE:")
+    print("1. Change default credentials in CREDENTIALS dict")
+    print("2. Generate password hash with:")
+    print('   python3 -c "from werkzeug.security import generate_password_hash; print(generate_password_hash(\'your_password\'))"')
+    print("3. Use HTTPS in production (reverse proxy with nginx/Apache)")
+    print("4. Keep Flask updated for security patches")
+    print("=" * 50)
     print("Access from phone: http://<raspberry-pi-ip>:8080")
     print("Press Ctrl+C to stop")
     try:
@@ -987,5 +1413,8 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\nShutting down...")
         if camera:
-            camera.stop()
+            try:
+                camera.stop()
+            except:
+                pass
         print("Server stopped")
