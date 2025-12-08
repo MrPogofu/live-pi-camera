@@ -156,25 +156,41 @@ def start_recording():
             print(f"Recording settings: {record_config['width']}x{record_config['height']} @ {record_config['fps']}fps")
             
             # Stop current camera and reconfigure for recording
-            camera.stop()
-            time.sleep(0.5)
+            try:
+                camera.stop()
+            except Exception as e:
+                print(f"Error stopping camera before reconfigure: {e}")
             
-            # Configure camera with recording settings
-            video_config = camera.create_video_configuration(
-                main={"size": (record_config['width'], record_config['height']), 
-                      "format": "RGB888"},
-                controls={"FrameRate": record_config['fps']}
-            )
-            camera.configure(video_config)
+            time.sleep(1)  # Longer pause for high-res switching
+            
+            try:
+                # Configure camera with recording settings
+                video_config = camera.create_video_configuration(
+                    main={"size": (record_config['width'], record_config['height']), 
+                          "format": "RGB888"},
+                    controls={"FrameRate": record_config['fps']}
+                )
+                camera.configure(video_config)
+            except Exception as e:
+                print(f"Error configuring camera: {e}")
+                raise
             
             # Set auto exposure and white balance
-            camera.set_controls({
-                "AeEnable": True,
-                "AwbEnable": True
-            })
+            try:
+                camera.set_controls({
+                    "AeEnable": True,
+                    "AwbEnable": True
+                })
+            except Exception as e:
+                print(f"Error setting controls: {e}")
             
-            camera.start()
-            time.sleep(1)  # Let camera stabilize
+            try:
+                camera.start()
+            except Exception as e:
+                print(f"Error starting camera: {e}")
+                raise
+            
+            time.sleep(2)  # Let camera stabilize - important for high resolution
             
             # Create encoder with appropriate bitrate
             # Higher resolution needs higher bitrate
@@ -185,11 +201,13 @@ def start_recording():
             else:
                 bitrate = 10000000  # 10Mbps for SD
             
-            encoder = H264Encoder(bitrate=bitrate)
-            output = FileOutput(filename)
-            
-            # Start recording
-            camera.start_recording(encoder, output)
+            try:
+                encoder = H264Encoder(bitrate=bitrate)
+                output = FileOutput(filename)
+                camera.start_recording(encoder, output)
+            except Exception as e:
+                print(f"Error starting encoder: {e}")
+                raise
             
             recording = True
             
@@ -201,12 +219,30 @@ def start_recording():
             })
         except Exception as e:
             print(f"Recording start error: {e}")
+            recording = False
             # Try to recover camera for streaming
             try:
-                camera.stop()
-                init_camera()
+                if camera:
+                    try:
+                        camera.stop_recording()
+                    except:
+                        pass
+                    try:
+                        camera.stop()
+                    except:
+                        pass
+                    try:
+                        camera.close()
+                    except:
+                        pass
+                camera = None
             except:
                 pass
+            time.sleep(1)
+            try:
+                init_camera()
+            except Exception as init_err:
+                print(f"Recovery init error: {init_err}")
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/stop_recording', methods=['POST'])
@@ -219,18 +255,30 @@ def stop_recording():
         
         try:
             print("Stopping recording")
-            camera.stop_recording()
-            camera.stop()
+            
+            # Stop recording first
+            try:
+                camera.stop_recording()
+            except Exception as e:
+                print(f"Error stopping recording: {e}")
+            
+            # Stop camera
+            try:
+                camera.stop()
+            except Exception as e:
+                print(f"Error stopping camera: {e}")
+            
             recording = False
+            time.sleep(0.5)  # Brief pause
 
-            # Release camera object before re-initializing
+            # Close and fully release camera
             try:
                 camera.close()
             except Exception as e:
                 print(f"Camera close error: {e}")
             
             camera = None
-            time.sleep(1)  # Allow hardware to fully reset
+            time.sleep(1)  # Give hardware time to fully reset
 
             # Restart camera with streaming configuration
             init_camera()
@@ -243,7 +291,14 @@ def stop_recording():
             # Try to recover camera
             try:
                 if camera:
-                    camera.stop()
+                    try:
+                        camera.stop_recording()
+                    except:
+                        pass
+                    try:
+                        camera.stop()
+                    except:
+                        pass
                     try:
                         camera.close()
                     except:
@@ -251,6 +306,7 @@ def stop_recording():
             except Exception as e2:
                 print(f"Camera stop error during recovery: {e2}")
             camera = None
+            time.sleep(1)
             try:
                 init_camera()
             except Exception as e3:
