@@ -43,15 +43,12 @@ def init_camera():
         if camera is not None:
             try:
                 camera.stop()
-            except Exception as e:
-                print(f"Camera stop error during re-init: {e}")
-            try:
                 camera.close()
             except Exception as e:
-                print(f"Camera close error during re-init: {e}")
+                print(f"Camera stop/close error during re-init: {e}")
             camera = None
             stream_active = False
-            time.sleep(0.5)  # Give hardware a moment to reset
+            time.sleep(1)  # Give hardware time to fully reset
 
         print("Initializing camera...")
         camera = Picamera2()
@@ -80,6 +77,7 @@ def init_camera():
     except Exception as e:
         print(f"Error initializing camera: {e}")
         stream_active = False
+        camera = None
 
 def generate_frames():
     """Generate MJPEG frames for streaming"""
@@ -141,35 +139,43 @@ def video_feed():
 @app.route('/start_recording', methods=['POST'])
 def start_recording():
     global recording
+    
     with recording_lock:
         if recording:
             return jsonify({'status': 'error', 'message': 'Already recording'})
+        
         if camera is None:
             return jsonify({'status': 'error', 'message': 'Camera not initialized'})
+        
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"/home/pi/videos/video_{timestamp}.h264"
             os.makedirs("/home/pi/videos", exist_ok=True)
+            
             print(f"Starting recording to {filename}")
             print(f"Recording settings: {record_config['width']}x{record_config['height']} @ {record_config['fps']}fps")
+            
             # Stop current camera and reconfigure for recording
             camera.stop()
-            camera.close()
+            time.sleep(0.5)
+            
             # Configure camera with recording settings
-            camera = Picamera2()
             video_config = camera.create_video_configuration(
                 main={"size": (record_config['width'], record_config['height']), 
                       "format": "RGB888"},
                 controls={"FrameRate": record_config['fps']}
             )
             camera.configure(video_config)
+            
             # Set auto exposure and white balance
             camera.set_controls({
                 "AeEnable": True,
                 "AwbEnable": True
             })
+            
             camera.start()
             time.sleep(1)  # Let camera stabilize
+            
             # Create encoder with appropriate bitrate
             # Higher resolution needs higher bitrate
             if record_config['width'] >= 1920:
@@ -178,11 +184,15 @@ def start_recording():
                 bitrate = 15000000  # 15Mbps for HD
             else:
                 bitrate = 10000000  # 10Mbps for SD
+            
             encoder = H264Encoder(bitrate=bitrate)
             output = FileOutput(filename)
+            
             # Start recording
             camera.start_recording(encoder, output)
+            
             recording = True
+            
             print("Recording started successfully")
             return jsonify({
                 'status': 'success',
@@ -194,34 +204,37 @@ def start_recording():
             # Try to recover camera for streaming
             try:
                 camera.stop()
-            except Exception:
-                pass
-            try:
-                camera.close()
-            except Exception:
-                pass
-            try:
                 init_camera()
-            except Exception:
+            except:
                 pass
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/stop_recording', methods=['POST'])
 def stop_recording():
     global recording, camera
+
     with recording_lock:
         if not recording:
             return jsonify({'status': 'error', 'message': 'Not recording'})
+        
         try:
             print("Stopping recording")
             camera.stop_recording()
             camera.stop()
-            camera.close()
             recording = False
+
+            # Release camera object before re-initializing
+            try:
+                camera.close()
+            except Exception as e:
+                print(f"Camera close error: {e}")
+            
             camera = None
-            time.sleep(0.5)  # Allow hardware to reset
+            time.sleep(1)  # Allow hardware to fully reset
+
             # Restart camera with streaming configuration
             init_camera()
+
             print("Recording stopped successfully")
             return jsonify({'status': 'success'})
         except Exception as e:
@@ -231,13 +244,12 @@ def stop_recording():
             try:
                 if camera:
                     camera.stop()
+                    try:
+                        camera.close()
+                    except:
+                        pass
             except Exception as e2:
                 print(f"Camera stop error during recovery: {e2}")
-            try:
-                if camera:
-                    camera.close()
-            except Exception as e2:
-                print(f"Camera close error during recovery: {e2}")
             camera = None
             try:
                 init_camera()
@@ -785,7 +797,7 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then r => r.json())
+                .then(r => r.json())
                 .then(data => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
@@ -836,7 +848,7 @@ WEB_INTERFACE = '''
         // Check status periodically
         setInterval(() => {
             fetch('/status')
-                .then r => r.json())
+                .then(r => r.json())
                 .then(data => {
                     cameraReady = data.camera_ready;
                     
