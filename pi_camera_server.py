@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-import importlib
-import subprocess
-import os
-import sys
-
-required_packages = ['flask', 'picamera2']
-def ensure_packages(packages):
-    for package in packages:
-        print(f"Checking for package: {package}")
-        try:
-            importlib.import_module(package)
-        except ImportError:
-            print(f"Installing missing package: {package}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-ensure_packages(required_packages)
-
 from flask import Flask, Response, render_template_string, request, jsonify
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder, Quality
