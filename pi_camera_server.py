@@ -353,11 +353,10 @@ def stop_recording():
                 print(f"Camera close error: {e}")
             
             camera = None
-            stream_active = False  # <-- Ensure stream_active is reset
-            time.sleep(1)  # Give hardware time to fully reset
-
+            stream_active = False
+            time.sleep(1)
             # Restart camera with streaming configuration
-            init_camera()
+            init_camera()  # <-- This will re-init camera for streaming
 
             print("Recording stopped successfully")
             return jsonify({'status': 'success'})
@@ -382,7 +381,7 @@ def stop_recording():
             except Exception as e2:
                 print(f"Camera stop error during recovery: {e2}")
             camera = None
-            stream_active = False  # <-- Ensure stream_active is reset on error
+            stream_active = False
             time.sleep(1)
             try:
                 init_camera()
@@ -476,7 +475,7 @@ def delete_file(filename):
 @app.route('/update_stream_settings', methods=['POST'])
 @require_login
 def update_stream_settings():
-    global stream_config
+    global stream_config, camera, stream_active
     data = request.json
     
     if 'width' in data:
@@ -487,8 +486,25 @@ def update_stream_settings():
         stream_config['fps'] = int(data['fps'])
     
     print(f"Stream settings updated: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
-    print("Settings will apply on next camera restart")
-    
+    print("Restarting camera to apply new stream settings...")
+    # Force camera re-init to apply new settings immediately
+    try:
+        if camera:
+            try:
+                camera.stop()
+            except Exception as e:
+                print(f"Error stopping camera before re-init: {e}")
+            try:
+                camera.close()
+            except Exception as e:
+                print(f"Error closing camera before re-init: {e}")
+        camera = None
+        stream_active = False
+        time.sleep(1)
+        init_camera()
+    except Exception as e:
+        print(f"Error re-initializing camera after stream settings update: {e}")
+
     return jsonify({'status': 'success', 'settings': stream_config})
 
 @app.route('/update_record_settings', methods=['POST'])
@@ -1081,11 +1097,40 @@ WEB_INTERFACE = '''
             } else {
                 btn.textContent = 'START RECORDING';
                 btn.classList.remove('recording');
-                status.textContent = 'Status: Ready';
+                status.textContent = 'Status: Restarting camera...';
                 
-                // Reload stream after recording stops
-                setTimeout(() => {
-                    document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
+                // Wait for camera to reinitialize, then reload stream
+                // Poll status until camera is ready
+                let retries = 0;
+                const maxRetries = 10;
+                const recheckInterval = setInterval(() => {
+                    fetch('/status')
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.camera_ready && data.stream_active) {
+                                clearInterval(recheckInterval);
+                                status.textContent = 'Status: Reconnecting stream...';
+                                
+                                // Now reload the stream
+                                setTimeout(() => {
+                                    document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
+                                    status.textContent = 'Status: Ready';
+                                }, 500);
+                            } else if (retries >= maxRetries) {
+                                clearInterval(recheckInterval);
+                                status.textContent = 'Status: Camera timeout - refresh page';
+                                status.classList.add('error');
+                            }
+                            retries++;
+                        })
+                        .catch(err => {
+                            retries++;
+                            if (retries >= maxRetries) {
+                                clearInterval(recheckInterval);
+                                status.textContent = 'Status: Connection error - refresh page';
+                                status.classList.add('error');
+                            }
+                        });
                 }, 1000);
             }
         }
