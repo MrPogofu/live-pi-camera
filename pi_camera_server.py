@@ -106,39 +106,59 @@ def init_camera():
         camera = None
 
 def generate_frames():
-    """Generate MJPEG frames for streaming - always send the newest frame"""
+    """Generate MJPEG frames for streaming"""
     global stream_active, camera
-
+    
     # Try to initialize camera if needed
     if not stream_active or camera is None:
         print("Camera not active, initializing...")
         init_camera()
-
+    
     if not stream_active or camera is None:
         print("Camera not available for streaming")
+        # Return a blank frame to prevent HTML error response
         blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
         yield (b'--frame\r\n'
                b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
         time.sleep(1)
         return
-
+    
+    # Calculate delay based on FPS to limit frame rate
+    frame_delay = 1.0 / stream_config['fps']
+    last_frame_time = 0
     error_count = 0
-
+    
     try:
         while True:
             try:
-                # Always get the latest frame, no throttling
+                # Throttle frame rate
+                current_time = time.time()
+                time_since_last = current_time - last_frame_time
+                if time_since_last < frame_delay:
+                    time.sleep(frame_delay - time_since_last)
+                
+                last_frame_time = time.time()
+                
+                # Capture frame as numpy array
                 frame = camera.capture_array()
+                
+                # Encode to JPEG with quality 70 for balance
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                
                 if not ret:
                     continue
-                error_count = 0
+                
+                error_count = 0  # Reset error count on success
                 frame_bytes = buffer.tobytes()
+                
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                       
             except Exception as e:
                 error_count += 1
                 print(f"Frame capture error ({error_count}): {e}")
+                
+                # If too many errors, try reinitializing
                 if error_count > 5:
                     print("Too many frame errors, attempting camera reinit...")
                     try:
@@ -149,8 +169,10 @@ def generate_frames():
                         pass
                     init_camera()
                     error_count = 0
+                
                 time.sleep(0.1)
                 continue
+                
     except GeneratorExit:
         print("Stream client disconnected")
     except Exception as e:
@@ -572,7 +594,7 @@ LOGIN_INTERFACE = '''
         .login-header h1 {
             font-size: 28px;
             margin-bottom: 8px;
-            color: #4CAF50;
+            color: #007bff;
         }
         .login-header p {
             color: #888;
@@ -600,12 +622,12 @@ LOGIN_INTERFACE = '''
         }
         .form-group input:focus {
             outline: none;
-            border-color: #4CAF50;
+            border-color: #007bff;
         }
         .login-btn {
             width: 100%;
             padding: 12px;
-            background: #4CAF50;
+            background: #007bff;
             color: white;
             border: none;
             border-radius: 8px;
@@ -615,10 +637,10 @@ LOGIN_INTERFACE = '''
             transition: all 0.2s;
         }
         .login-btn:hover {
-            background: #45a049;
+            background: #006bde;
         }
         .login-btn:active {
-            background: #3d8b40;
+            background: #004997;
         }
         .login-btn:disabled {
             background: #666;
