@@ -815,7 +815,7 @@ LOGIN_INTERFACE = '''
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, password })
             })
-            .then(r => r.json())
+            .then((r) => r.json())
             .then(data => {
                 if (data.status === 'success') {
                     window.location.href = '/';
@@ -1148,8 +1148,8 @@ WEB_INTERFACE = '''
         // Load current settings on page load
         function loadCurrentSettings() {
             fetch('/status')
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     cameraReady = data.camera_ready;
                     
                     // Update stream settings
@@ -1165,7 +1165,7 @@ WEB_INTERFACE = '''
                     // Update initial status
                     updateStatusDisplay(data);
                 })
-                .catch(err => {
+                .catch((err) => {
                     console.log('Failed to load settings:', err);
                     document.getElementById('status').textContent = 'Status: Waiting for camera...';
                     document.getElementById('status').classList.remove('error');
@@ -1213,8 +1213,8 @@ WEB_INTERFACE = '''
             const url = isRecording ? '/stop_recording' : '/start_recording';
             
             fetch(url, { method: 'POST' })
-                .then r => r.json())
-                .then data => {
+                .then((r) => r.json())
+                .then((data) => {
                     btn.disabled = false;
                     if (data.status === 'success') {
                         isRecording = !isRecording;
@@ -1225,7 +1225,7 @@ WEB_INTERFACE = '''
                         document.getElementById('status').classList.add('error');
                     }
                 })
-                .catch(err => {
+                .catch((err) => {
                     btn.disabled = false;
                     alert('Error: ' + err);
                     document.getElementById('status').textContent = 'Status: Connection error';
@@ -1285,8 +1285,8 @@ WEB_INTERFACE = '''
             list.innerHTML = '<div class="empty-message">Loading recordings...</div>';
             
             fetch('/list_recordings')
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     if (data.status === 'success') {
                         if (data.recordings.length === 0) {
                             list.innerHTML = '<div class="empty-message">No recordings found</div>';
@@ -1314,7 +1314,7 @@ WEB_INTERFACE = '''
                         list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
                     }
                 })
-                .catch(err => {
+                .catch((err) => {
                     list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
                 });
         }
@@ -1338,15 +1338,15 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then r => r.json())
-                .then data => {
+                .then((r) => r.json())
+                .then((data) => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
                     } else {
                         alert('Error: ' + data.message);
                     }
                 })
-                .catch(err => alert('Error: ' + err));
+                .catch((err) => alert('Error: ' + err));
         }
 
         function saveSettings() {
@@ -1408,8 +1408,8 @@ WEB_INTERFACE = '''
             btn.disabled = true;
             btn.textContent = 'REBOOTING...';
             fetch('/reboot', {method: 'POST'})
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     if (data.status === 'success') {
                         document.getElementById('status').textContent = 'Status: ' + data.message;
                         setTimeout(() => {
@@ -1422,7 +1422,7 @@ WEB_INTERFACE = '''
                         btn.disabled = false;
                     }
                 })
-                .catch(err => {
+                .catch((err) => {
                     alert('Reboot error: ' + err);
                     btn.textContent = 'REBOOT';
                     btn.disabled = false;
@@ -1435,8 +1435,8 @@ WEB_INTERFACE = '''
         // Check status periodically
         setInterval(() => {
             fetch('/status')
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     cameraReady = data.camera_ready;
                     
                     if (data.recording !== isRecording) {
@@ -1446,7 +1446,7 @@ WEB_INTERFACE = '''
                         updateStatusDisplay(data);
                     }
                 })
-                .catch(err => {
+                .catch((err) => {
                     console.log('Status check failed:', err);
                 });
         }, 1000);
