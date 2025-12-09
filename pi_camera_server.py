@@ -594,7 +594,7 @@ LOGIN_INTERFACE = '''
         .login-header h1 {
             font-size: 28px;
             margin-bottom: 8px;
-            color: #007bff;
+            color: #4CAF50;
         }
         .login-header p {
             color: #888;
@@ -622,12 +622,12 @@ LOGIN_INTERFACE = '''
         }
         .form-group input:focus {
             outline: none;
-            border-color: #007bff;
+            border-color: #4CAF50;
         }
         .login-btn {
             width: 100%;
             padding: 12px;
-            background: #007bff;
+            background: #4CAF50;
             color: white;
             border: none;
             border-radius: 8px;
@@ -637,10 +637,10 @@ LOGIN_INTERFACE = '''
             transition: all 0.2s;
         }
         .login-btn:hover {
-            background: #006bde;
+            background: #45a049;
         }
         .login-btn:active {
-            background: #004997;
+            background: #3d8b40;
         }
         .login-btn:disabled {
             background: #666;
