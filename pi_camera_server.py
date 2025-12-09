@@ -779,8 +779,12 @@ WEB_INTERFACE = '''
             background: #1a1a1a;
             min-height: 240px;
             object-fit: contain;
-            width: 640px;
+            width: 100%;
         }
+        @media (max-width: 768px) {
+            #stream {
+                width: 640px;
+            }
         .controls {
             margin-top: 15px;
             display: flex;
