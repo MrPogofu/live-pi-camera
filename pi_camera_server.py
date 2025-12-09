@@ -1213,7 +1213,7 @@ WEB_INTERFACE = '''
             const url = isRecording ? '/stop_recording' : '/start_recording';
             
             fetch(url, { method: 'POST' })
-                .then(r => r.json())
+                .then r => r.json())
                 .then data => {
                     btn.disabled = false;
                     if (data.status === 'success') {
