@@ -257,35 +257,34 @@ def video_feed():
 @require_login
 def start_recording():
     global recording, camera
-    
+
     with recording_lock:
         if recording:
             return jsonify({'status': 'error', 'message': 'Already recording'})
-        
+
         if camera is None:
             return jsonify({'status': 'error', 'message': 'Camera not initialized'})
-        
+
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"/home/pi/videos/video_{timestamp}.h264"
             os.makedirs("/home/pi/videos", exist_ok=True)
-            
+
             print(f"Starting recording to {filename}")
             print(f"Recording settings: {record_config['width']}x{record_config['height']} @ {record_config['fps']}fps")
-            
+
             # Stop current camera and reconfigure for recording
             try:
                 camera.stop()
             except Exception as e:
                 print(f"Error stopping camera before reconfigure: {e}")
-            # --- Stop frame grabber before reconfiguring camera ---
-            stop_frame_grabber()
+            # --- Do NOT stop frame grabber here ---
             time.sleep(1)  # Longer pause for high-res switching
-            
+
             try:
                 # Configure camera with recording settings
                 video_config = camera.create_video_configuration(
-                    main={"size": (record_config['width'], record_config['height']), 
+                    main={"size": (record_config['width'], record_config['height']),
                           "format": "RGB888"},
                     controls={"FrameRate": record_config['fps']}
                 )
@@ -293,7 +292,7 @@ def start_recording():
             except Exception as e:
                 print(f"Error configuring camera: {e}")
                 raise
-            
+
             # Set auto exposure and white balance
             try:
                 camera.set_controls({
@@ -302,15 +301,15 @@ def start_recording():
                 })
             except Exception as e:
                 print(f"Error setting controls: {e}")
-            
+
             try:
                 camera.start()
             except Exception as e:
                 print(f"Error starting camera: {e}")
                 raise
-            
+
             time.sleep(2)  # Let camera stabilize - important for high resolution
-            
+
             # Create encoder with appropriate bitrate
             # Higher resolution needs higher bitrate
             if record_config['width'] >= 1920:
@@ -319,7 +318,7 @@ def start_recording():
                 bitrate = 15000000  # 15Mbps for HD
             else:
                 bitrate = 10000000  # 10Mbps for SD
-            
+
             try:
                 encoder = H264Encoder(bitrate=bitrate)
                 output = FileOutput(filename)
@@ -327,10 +326,12 @@ def start_recording():
             except Exception as e:
                 print(f"Error starting encoder: {e}")
                 raise
-            
+
             recording = True
-            
+
             print("Recording started successfully")
+            # --- Start frame grabber again in case camera was reconfigured ---
+            start_frame_grabber()
             return jsonify({
                 'status': 'success',
                 'filename': filename,
@@ -372,22 +373,22 @@ def stop_recording():
     with recording_lock:
         if not recording:
             return jsonify({'status': 'error', 'message': 'Not recording'})
-        
+
         try:
             print("Stopping recording")
-            
+
             # Stop recording first
             try:
                 camera.stop_recording()
             except Exception as e:
                 print(f"Error stopping recording: {e}")
-            
+
             # Stop camera
             try:
                 camera.stop()
             except Exception as e:
                 print(f"Error stopping camera: {e}")
-            
+
             recording = False
             time.sleep(0.5)  # Brief pause
 
@@ -396,13 +397,12 @@ def stop_recording():
                 camera.close()
             except Exception as e:
                 print(f"Camera close error: {e}")
-            # --- Stop frame grabber before closing camera ---
-            stop_frame_grabber()
+            # --- Do NOT stop frame grabber here ---
             camera = None
-            time.sleep(1)  # Give hardware time to fully reset
+            time.sleep(0.5)  # Shorter pause
 
-            # Restart camera with streaming configuration
-            init_camera()
+            # Restart camera with streaming configuration in background
+            threading.Thread(target=init_camera, daemon=True).start()
 
             print("Recording stopped successfully")
             return jsonify({'status': 'success'})
@@ -429,7 +429,7 @@ def stop_recording():
             camera = None
             time.sleep(1)
             try:
-                init_camera()
+                threading.Thread(target=init_camera, daemon=True).start()
             except Exception as e3:
                 print(f"Camera re-init error during recovery: {e3}")
             return jsonify({'status': 'error', 'message': str(e)})
@@ -866,7 +866,7 @@ WEB_INTERFACE = '''
         .container {
             max-width: 720px;
             padding: 10px;
-            position: relative;
+            position: relative; /* Ensure absolute children are positioned correctly */
         }
         #stream {
             width: 640px;
@@ -1061,6 +1061,7 @@ WEB_INTERFACE = '''
             position: absolute;
             top: 10px;
             right: 10px;
+            z-index: 10;
         }
         .logout-btn:active { background: #c82333; }
         .user-info {
@@ -1069,6 +1070,7 @@ WEB_INTERFACE = '''
             left: 10px;
             color: #aaa;
             font-size: 12px;
+            z-index: 10;
         }
         .reboot-btn {
             position: absolute;
@@ -1079,6 +1081,7 @@ WEB_INTERFACE = '''
             font-size: 14px;
             padding: 10px 15px;
             border-radius: 8px;
+            z-index: 10;
         }
         .reboot-btn:active { background: #e68900; }
     </style>
@@ -1170,17 +1173,27 @@ WEB_INTERFACE = '''
     <script>
         let isRecording = false;
         let cameraReady = false;
-        // --- FPS calculation ---
+        // --- FPS calculation workaround ---
         let lastFrameTime = null;
         let fps = 0;
         let fpsSamples = [];
+        let lastFrameCount = 0;
+        let frameCounter = 0;
         const fpsLabel = document.getElementById('fpsLabel');
         const streamImg = document.getElementById('stream');
+
+        // MJPEG <img> load event is unreliable, so use a timer to reload the stream and count frames
+        function reloadStream() {
+            streamImg.src = '{{ url_for("video_feed") }}?' + new Date().getTime();
+        }
+
+        // Count frames by using a hidden <img> that loads the stream and fires load events
+        // But for now, just try to update FPS on each reload
         streamImg.addEventListener('load', function() {
             const now = performance.now();
             if (lastFrameTime !== null) {
                 const dt = now - lastFrameTime;
-                if (dt > 0 && dt < 2000) { // Ignore huge jumps
+                if (dt > 0 && dt < 2000) {
                     const currentFps = 1000 / dt;
                     fpsSamples.push(currentFps);
                     if (fpsSamples.length > 10) fpsSamples.shift();
@@ -1191,6 +1204,21 @@ WEB_INTERFACE = '''
             }
             lastFrameTime = now;
         });
+
+        // Periodically reload the stream to force load events (simulate frame updates)
+        setInterval(() => {
+            if (!isRecording) {
+                reloadStream();
+            }
+        }, 1000); // Reload every second
+
+        // If no frame for 2 seconds, show FPS: --
+        setInterval(() => {
+            if (lastFrameTime && (performance.now() - lastFrameTime > 2000)) {
+                fpsLabel.textContent = 'FPS: --';
+            }
+        }, 500);
+
         // Load current settings on page load
         function loadCurrentSettings() {
             fetch('/status')
@@ -1222,7 +1250,7 @@ WEB_INTERFACE = '''
             const status = document.getElementById('status');
             
             if (data.recording) {
-                status.textContent = 'Status: Recording... (stream paused)';
+                status.textContent = 'Status: Recording...';
                 status.classList.remove('error');
             } else if (data.camera_ready) {
                 status.textContent = 'Status: Ready';
@@ -1287,9 +1315,9 @@ WEB_INTERFACE = '''
             if (isRecording) {
                 btn.textContent = 'STOP RECORDING';
                 btn.classList.add('recording');
-                status.textContent = 'Status: Recording... (stream paused)';
-                // Hide FPS label while recording (stream paused)
-                fpsLabel.style.visibility = 'hidden';
+                status.textContent = 'Status: Recording...';
+                // Show FPS label while recording (stream not paused)
+                fpsLabel.style.visibility = 'visible';
             } else {
                 btn.textContent = 'START RECORDING';
                 btn.classList.remove('recording');
@@ -1297,7 +1325,7 @@ WEB_INTERFACE = '''
                 fpsLabel.style.visibility = 'visible';
                 // Reload stream after recording stops
                 setTimeout(() => {
-                    document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
+                    reloadStream();
                 }, 1000);
             }
         }
