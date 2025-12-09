@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Raspberry Pi Zero Camera Server for FTC Robot
-Install: pip3 install picamera2 flask opencv-python
+Install: pip3 install picamera2 flask opencv-python ffmpeg-python
 Run: python3 camera_server.py
 """
 
@@ -16,6 +16,7 @@ import os
 import cv2
 import secrets
 import hashlib
+import subprocess
 
 app = Flask(__name__)
 
@@ -409,16 +410,33 @@ def list_recordings():
         
         files = []
         for filename in os.listdir(video_dir):
+            # Only list MP4 files (or H.264 if MP4 not yet converted)
             if filename.endswith('.h264'):
-                filepath = os.path.join(video_dir, filename)
-                size = os.path.getsize(filepath)
-                mtime = os.path.getmtime(filepath)
-                files.append({
-                    'name': filename,
-                    'size': size,
-                    'size_mb': round(size / (1024 * 1024), 2),
-                    'date': datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
-                })
+                # Check if MP4 version exists
+                mp4_filename = filename.replace('.h264', '.mp4')
+                mp4_path = os.path.join(video_dir, mp4_filename)
+                
+                if os.path.exists(mp4_path):
+                    # Use MP4 if available
+                    filepath = mp4_path
+                    display_filename = mp4_filename
+                else:
+                    # Fall back to H.264
+                    filepath = os.path.join(video_dir, filename)
+                    display_filename = filename
+                
+                try:
+                    size = os.path.getsize(filepath)
+                    mtime = os.path.getmtime(filepath)
+                    files.append({
+                        'name': display_filename,
+                        'original_h264': filename,
+                        'size': size,
+                        'size_mb': round(size / (1024 * 1024), 2),
+                        'date': datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                except Exception as e:
+                    print(f"Error getting file info for {filename}: {e}")
         
         # Sort by date, newest first
         files.sort(key=lambda x: x['date'], reverse=True)
@@ -435,17 +453,37 @@ def download_file(filename):
             return "Cannot download while recording", 400
         
         video_dir = "/home/pi/videos"
-        filepath = os.path.join(video_dir, filename)
         
         # Security check - ensure filename doesn't contain path traversal
         if '..' in filename or '/' in filename:
             return "Invalid filename", 400
         
+        # If requesting H.264, convert to MP4 first
+        if filename.endswith('.h264'):
+            h264_path = os.path.join(video_dir, filename)
+            if not os.path.exists(h264_path):
+                return "File not found", 404
+            
+            mp4_filename = filename.replace('.h264', '.mp4')
+            mp4_path = os.path.join(video_dir, mp4_filename)
+            
+            # Convert if MP4 doesn't exist
+            if not os.path.exists(mp4_path):
+                mp4_path = convert_h264_to_mp4(h264_path)
+                if mp4_path is None:
+                    return "Conversion failed", 500
+            
+            filepath = mp4_path
+            download_filename = mp4_filename
+        else:
+            filepath = os.path.join(video_dir, filename)
+            download_filename = filename
+        
         if not os.path.exists(filepath):
             return "File not found", 404
         
         from flask import send_file
-        return send_file(filepath, as_attachment=True, download_name=filename)
+        return send_file(filepath, as_attachment=True, download_name=download_filename)
     except Exception as e:
         return str(e), 500
 
@@ -457,52 +495,74 @@ def delete_file(filename):
             return jsonify({'status': 'error', 'message': 'Cannot delete while recording'})
         
         video_dir = "/home/pi/videos"
-        filepath = os.path.join(video_dir, filename)
         
         # Security check
         if '..' in filename or '/' in filename:
             return jsonify({'status': 'error', 'message': 'Invalid filename'})
         
+        filepath = os.path.join(video_dir, filename)
+        
         if not os.path.exists(filepath):
             return jsonify({'status': 'error', 'message': 'File not found'})
         
+        # Delete the file
         os.remove(filepath)
+        
+        # Also try to delete corresponding MP4 or H.264 if deleting the other format
+        if filename.endswith('.mp4'):
+            h264_path = filepath.replace('.mp4', '.h264')
+            if os.path.exists(h264_path):
+                try:
+                    os.remove(h264_path)
+                except:
+                    pass
+        elif filename.endswith('.h264'):
+            mp4_path = filepath.replace('.h264', '.mp4')
+            if os.path.exists(mp4_path):
+                try:
+                    os.remove(mp4_path)
+                except:
+                    pass
+        
         return jsonify({'status': 'success', 'message': 'File deleted'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
-@app.route('/update_stream_settings', methods=['POST'])
-@require_login
-def update_stream_settings():
-    global stream_config
-    data = request.json
+def convert_h264_to_mp4(h264_path):
+    """Convert H.264 video to MP4 format using ffmpeg"""
+    mp4_path = h264_path.replace('.h264', '.mp4')
     
-    if 'width' in data:
-        stream_config['width'] = int(data['width'])
-    if 'height' in data:
-        stream_config['height'] = int(data['height'])
-    if 'fps' in data:
-        stream_config['fps'] = int(data['fps'])
+    # Check if MP4 already exists
+    if os.path.exists(mp4_path):
+        return mp4_path
     
-    print(f"Stream settings updated: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
-    print("Settings will apply on next camera restart")
-    
-    return jsonify({'status': 'success', 'settings': stream_config})
-
-@app.route('/update_record_settings', methods=['POST'])
-@require_login
-def update_record_settings():
-    global record_config
-    data = request.json
-    
-    if 'width' in data:
-        record_config['width'] = int(data['width'])
-    if 'height' in data:
-        record_config['height'] = int(data['height'])
-    if 'fps' in data:
-        record_config['fps'] = int(data['fps'])
-    
-    return jsonify({'status': 'success', 'settings': record_config})
+    try:
+        print(f"Converting {h264_path} to MP4...")
+        # Use ffmpeg to convert H.264 to MP4
+        # -c:v copy uses the same codec (faster)
+        # -c:a aac adds audio codec
+        # -y overwrites output file
+        subprocess.run([
+            'ffmpeg',
+            '-i', h264_path,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-y',
+            mp4_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        
+        if os.path.exists(mp4_path):
+            print(f"Conversion successful: {mp4_path}")
+            return mp4_path
+        else:
+            print(f"Conversion failed: MP4 file not created")
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"Conversion timeout for {h264_path}")
+        return None
+    except Exception as e:
+        print(f"Conversion error: {e}")
+        return None
 
 LOGIN_INTERFACE = '''
 <!DOCTYPE html>
