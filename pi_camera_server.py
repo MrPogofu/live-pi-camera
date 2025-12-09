@@ -233,14 +233,26 @@ def video_feed():
 @app.route('/start_recording', methods=['POST'])
 @require_login
 def start_recording():
-    global recording, camera
+    global recording, camera, stream_active
 
     with recording_lock:
         if recording:
             return jsonify({'status': 'error', 'message': 'Already recording'})
 
-        if camera is None:
-            return jsonify({'status': 'error', 'message': 'Camera not initialized'})
+        # --- Stop and close the main camera before recording ---
+        with camera_access_lock:
+            if camera is not None:
+                try:
+                    camera.stop()
+                except Exception as e:
+                    print(f"Error stopping main camera before recording: {e}")
+                try:
+                    camera.close()
+                except Exception as e:
+                    print(f"Error closing main camera before recording: {e}")
+                camera = None
+                stream_active = False
+                time.sleep(1)  # Allow hardware to reset
 
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -250,7 +262,6 @@ def start_recording():
             print(f"Starting recording to {filename}")
             print(f"Recording settings: {record_config['width']}x{record_config['height']} @ {record_config['fps']}fps")
 
-            # Instead of stopping the camera, use a new Picamera2 instance for recording
             rec_camera = Picamera2()
             video_config = rec_camera.create_video_configuration(
                 main={"size": (record_config['width'], record_config['height']),
@@ -276,7 +287,6 @@ def start_recording():
             output = FileOutput(filename)
             rec_camera.start_recording(encoder, output)
 
-            # Store the recording camera instance globally for stop_recording
             app.config['rec_camera'] = rec_camera
 
             recording = True
@@ -312,7 +322,7 @@ def start_recording():
 @app.route('/stop_recording', methods=['POST'])
 @require_login
 def stop_recording():
-    global recording
+    global recording, camera, stream_active
 
     with recording_lock:
         if not recording:
@@ -339,6 +349,10 @@ def stop_recording():
 
             recording = False
             print("Recording stopped successfully")
+
+            # --- Re-initialize main camera for streaming ---
+            init_camera()
+
             return jsonify({'status': 'success'})
         except Exception as e:
             print(f"Recording stop error: {e}")
@@ -360,6 +374,11 @@ def stop_recording():
                     app.config.pop('rec_camera', None)
             except Exception as e2:
                 print(f"Camera stop error during recovery: {e2}")
+            # --- Try to re-init camera even on error ---
+            try:
+                init_camera()
+            except:
+                pass
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/status', methods=['GET'])
