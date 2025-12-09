@@ -444,9 +444,48 @@ def download_file(filename):
         
         if not os.path.exists(filepath):
             return "File not found", 404
-        
+
+        # Only allow .h264 files
+        if not filename.endswith('.h264'):
+            return "Invalid file type", 400
+
+        # Convert to mp4 using ffmpeg
+        mp4_filename = filename.replace('.h264', '.mp4')
+        mp4_filepath = os.path.join(video_dir, mp4_filename)
+
+        # Only convert if mp4 doesn't exist or is older than h264
+        convert_needed = (
+            not os.path.exists(mp4_filepath) or
+            os.path.getmtime(mp4_filepath) < os.path.getmtime(filepath)
+        )
+
+        if convert_needed:
+            import subprocess
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-y',  # Overwrite output file if exists
+                '-framerate', '30',  # Default framerate, could be improved by reading metadata
+                '-i', filepath,
+                '-c:v', 'copy',
+                mp4_filepath
+            ]
+            try:
+                subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                return f"ffmpeg conversion error: {e}", 500
+
         from flask import send_file
-        return send_file(filepath, as_attachment=True, download_name=filename)
+        # Send mp4 file as attachment
+        response = send_file(mp4_filepath, as_attachment=True, download_name=mp4_filename)
+        # Optionally, clean up mp4 after sending (comment out if you want to keep mp4s)
+        def cleanup_file(path):
+            time.sleep(10)
+            try:
+                os.remove(path)
+            except Exception as e:
+                print(f"Cleanup error: {e}")
+        threading.Thread(target=cleanup_file, args=(mp4_filepath,), daemon=True).start()
+        return response
     except Exception as e:
         return str(e), 500
 
@@ -733,13 +772,14 @@ WEB_INTERFACE = '''
             position: relative;
         }
         #stream {
-            width: 100%;
             height: auto;
             display: block;
             border: 2px solid #333;
             border-radius: 8px;
             background: #1a1a1a;
             min-height: 240px;
+            object-fit: contain;
+            width: 640px;
         }
         .controls {
             margin-top: 15px;
