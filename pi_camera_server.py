@@ -322,7 +322,7 @@ def start_recording():
 @app.route('/stop_recording', methods=['POST'])
 @require_login
 def stop_recording():
-    global recording, camera
+    global recording, camera, stream_active
 
     with recording_lock:
         if not recording:
@@ -353,6 +353,7 @@ def stop_recording():
                 print(f"Camera close error: {e}")
             
             camera = None
+            stream_active = False  # <-- Ensure stream_active is reset
             time.sleep(1)  # Give hardware time to fully reset
 
             # Restart camera with streaming configuration
@@ -381,6 +382,7 @@ def stop_recording():
             except Exception as e2:
                 print(f"Camera stop error during recovery: {e2}")
             camera = None
+            stream_active = False  # <-- Ensure stream_active is reset on error
             time.sleep(1)
             try:
                 init_camera()
