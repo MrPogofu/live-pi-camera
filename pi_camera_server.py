@@ -869,13 +869,36 @@ WEB_INTERFACE = '''
             position: relative;
         }
         #stream {
-            width: 100%;
-            height: auto;
+            width: 640px;
+            height: 480px;
             display: block;
             border: 2px solid #333;
             border-radius: 8px;
             background: #1a1a1a;
             min-height: 240px;
+            object-fit: contain;
+            position: relative;
+            z-index: 1;
+        }
+        .fps-label {
+            position: absolute;
+            top: 18px;
+            left: 18px;
+            background: rgba(0,0,0,0.7);
+            color: #4CAF50;
+            font-size: 18px;
+            font-family: monospace;
+            padding: 4px 12px;
+            border-radius: 8px;
+            z-index: 2;
+            pointer-events: none;
+            user-select: none;
+        }
+        .stream-wrapper {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            margin: 0 auto;
         }
         .controls {
             margin-top: 15px;
@@ -1068,7 +1091,10 @@ WEB_INTERFACE = '''
         <button class="logout-btn" onclick="logout()">LOGOUT</button>
         <button class="reboot-btn" onclick="rebootPi()">REBOOT</button>
 
-        <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
+        <div class="stream-wrapper">
+            <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
+            <div class="fps-label" id="fpsLabel">FPS: --</div>
+        </div>
         
         <div class="controls">
             <button id="recordBtn" class="record-btn" onclick="toggleRecording()">
@@ -1144,7 +1170,27 @@ WEB_INTERFACE = '''
     <script>
         let isRecording = false;
         let cameraReady = false;
-
+        // --- FPS calculation ---
+        let lastFrameTime = null;
+        let fps = 0;
+        let fpsSamples = [];
+        const fpsLabel = document.getElementById('fpsLabel');
+        const streamImg = document.getElementById('stream');
+        streamImg.addEventListener('load', function() {
+            const now = performance.now();
+            if (lastFrameTime !== null) {
+                const dt = now - lastFrameTime;
+                if (dt > 0 && dt < 2000) { // Ignore huge jumps
+                    const currentFps = 1000 / dt;
+                    fpsSamples.push(currentFps);
+                    if (fpsSamples.length > 10) fpsSamples.shift();
+                    const avgFps = fpsSamples.reduce((a, b) => a + b, 0) / fpsSamples.length;
+                    fps = avgFps;
+                    fpsLabel.textContent = 'FPS: ' + Math.round(fps);
+                }
+            }
+            lastFrameTime = now;
+        });
         // Load current settings on page load
         function loadCurrentSettings() {
             fetch('/status')
@@ -1242,11 +1288,13 @@ WEB_INTERFACE = '''
                 btn.textContent = 'STOP RECORDING';
                 btn.classList.add('recording');
                 status.textContent = 'Status: Recording... (stream paused)';
+                // Hide FPS label while recording (stream paused)
+                fpsLabel.style.visibility = 'hidden';
             } else {
                 btn.textContent = 'START RECORDING';
                 btn.classList.remove('recording');
                 status.textContent = 'Status: Ready';
-                
+                fpsLabel.style.visibility = 'visible';
                 // Reload stream after recording stops
                 setTimeout(() => {
                     document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
