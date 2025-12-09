@@ -1087,29 +1087,29 @@ WEB_INTERFACE = '''
             const now = performance.now();
             if (lastFrameTime) {
                 frameTimes.push(now - lastFrameTime);
-                if (frameTimes.length > 20) frameTimes.shift();
-                const avg = frameTimes.reduce((a,b)=>a+b,0)/frameTimes.length;
-                fpsCounter.textContent = 'FPS: ' + (1000/avg).toFixed(1);
+                if (frameTimes.length > 20) { frameTimes.shift(); }
+                const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+                fpsCounter.textContent = 'FPS: ' + (1000 / avg).toFixed(1);
             }
             lastFrameTime = now;
         };
 
         // --- Reboot Pi ---
         function rebootPi() {
-            if (!confirm('Reboot Raspberry Pi?')) return;
+            if (!confirm('Reboot Raspberry Pi?')) { return; }
             fetch('/reboot', { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     alert(data.message || 'Rebooting...');
                 })
-                .catch(err => alert('Reboot error: ' + err));
+                .catch((err) => alert('Reboot error: ' + err));
         }
 
         // Load current settings on page load
         function loadCurrentSettings() {
             fetch('/status')
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     cameraReady = data.camera_ready;
                     
                     // Update stream settings
@@ -1129,7 +1129,7 @@ WEB_INTERFACE = '''
                     streamImg.style.width = "640px";
                     streamImg.style.height = "480px";
                 })
-                .catch(err => {
+                .catch((err) => {
                     console.log('Failed to load settings:', err);
                     document.getElementById('status').textContent = 'Status: Waiting for camera...';
                     document.getElementById('status').classList.remove('error');
@@ -1177,8 +1177,8 @@ WEB_INTERFACE = '''
             const url = isRecording ? '/stop_recording' : '/start_recording';
             
             fetch(url, { method: 'POST' })
-                .then(r => r.json())
-                .then data => {
+                .then((r) => r.json())
+                .then((data) => {
                     btn.disabled = false;
                     if (data.status === 'success') {
                         isRecording = !isRecording;
@@ -1189,7 +1189,7 @@ WEB_INTERFACE = '''
                         document.getElementById('status').classList.add('error');
                     }
                 })
-                .catch(err => {
+                .catch((err) => {
                     btn.disabled = false;
                     alert('Error: ' + err);
                     document.getElementById('status').textContent = 'Status: Connection error';
@@ -1249,13 +1249,13 @@ WEB_INTERFACE = '''
             list.innerHTML = '<div class="empty-message">Loading recordings...</div>';
             
             fetch('/list_recordings')
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     if (data.status === 'success') {
                         if (data.recordings.length === 0) {
                             list.innerHTML = '<div class="empty-message">No recordings found</div>';
                         } else {
-                            list.innerHTML = data.recordings.map(rec => `
+                            list.innerHTML = data.recordings.map((rec) => `
                                 <div class="recording-item">
                                     <div class="recording-name">${rec.name}</div>
                                     <div class="recording-info">
@@ -1263,11 +1263,11 @@ WEB_INTERFACE = '''
                                     </div>
                                     <div class="recording-actions">
                                         <button class="download-btn" onclick="downloadRecording('${rec.name}')" 
-                                                ${isRecording ? 'disabled' : ''}>
+                                                ${(isRecording ? 'disabled' : '')}>
                                             DOWNLOAD
                                         </button>
                                         <button class="delete-btn" onclick="deleteRecording('${rec.name}')"
-                                                ${isRecording ? 'disabled' : ''}>
+                                                ${(isRecording ? 'disabled' : '')}>
                                             DELETE
                                         </button>
                                     </div>
@@ -1278,7 +1278,7 @@ WEB_INTERFACE = '''
                         list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
                     }
                 })
-                .catch(err => {
+                .catch((err) => {
                     list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
                 });
         }
@@ -1302,15 +1302,15 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then r => r.json())
-                .then data => {
+                .then((r) => r.json())
+                .then((data) => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
                     } else {
                         alert('Error: ' + data.message);
                     }
                 })
-                .catch(err => alert('Error: ' + err));
+                .catch((err) => alert('Error: ' + err));
         }
 
         function saveSettings() {
@@ -1363,7 +1363,7 @@ WEB_INTERFACE = '''
                 .then(() => {
                     window.location.href = '/';
                 })
-                .catch(err => {
+                .catch((err) => {
                     alert('Logout error: ' + err);
                     window.location.href = '/';
                 });
@@ -1375,8 +1375,8 @@ WEB_INTERFACE = '''
         // Check status periodically
         setInterval(() => {
             fetch('/status')
-                .then(r => r.json())
-                .then(data => {
+                .then((r) => r.json())
+                .then((data) => {
                     cameraReady = data.camera_ready;
                     
                     if (data.recording !== isRecording) {
@@ -1386,7 +1386,7 @@ WEB_INTERFACE = '''
                         updateStatusDisplay(data);
                     }
                 })
-                .catch(err => {
+                .catch((err) => {
                     console.log('Status check failed:', err);
                 });
         }, 1000);
