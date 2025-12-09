@@ -400,6 +400,45 @@ def status():
         'record_config': record_config
     })
 
+@app.route('/update_stream_settings', methods=['POST'])
+@require_login
+def update_stream_settings():
+    global stream_config, camera, stream_active
+    
+    try:
+        data = request.json
+        stream_config['width'] = data.get('width', stream_config['width'])
+        stream_config['height'] = data.get('height', stream_config['height'])
+        stream_config['fps'] = data.get('fps', stream_config['fps'])
+        
+        print(f"Updated stream settings: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
+        
+        # Reinitialize camera with new settings
+        init_camera()
+        
+        return jsonify({'status': 'success', 'message': 'Stream settings updated'})
+    except Exception as e:
+        print(f"Error updating stream settings: {e}")
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/update_record_settings', methods=['POST'])
+@require_login
+def update_record_settings():
+    global record_config
+    
+    try:
+        data = request.json
+        record_config['width'] = data.get('width', record_config['width'])
+        record_config['height'] = data.get('height', record_config['height'])
+        record_config['fps'] = data.get('fps', record_config['fps'])
+        
+        print(f"Updated record settings: {record_config['width']}x{record_config['height']} @ {record_config['fps']}fps")
+        
+        return jsonify({'status': 'success', 'message': 'Record settings updated'})
+    except Exception as e:
+        print(f"Error updating record settings: {e}")
+        return jsonify({'status': 'error', 'message': str(e)})
+
 @app.route('/list_recordings', methods=['GET'])
 @require_login
 def list_recordings():
@@ -525,6 +564,16 @@ def delete_file(filename):
                     pass
         
         return jsonify({'status': 'success', 'message': 'File deleted'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/reboot', methods=['POST'])
+@require_login
+def reboot_pi():
+    try:
+        # Respond before rebooting to avoid client disconnect
+        threading.Thread(target=lambda: (time.sleep(1), os.system('sudo reboot'))).start()
+        return jsonify({'status': 'success', 'message': 'Rebooting Raspberry Pi...'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
@@ -953,6 +1002,17 @@ WEB_INTERFACE = '''
             color: #aaa;
             font-size: 12px;
         }
+        .reboot-btn {
+            position: absolute;
+            top: 10px;
+            right: 110px;
+            background: #ff9800;
+            color: white;
+            font-size: 14px;
+            padding: 10px 15px;
+            border-radius: 8px;
+        }
+        .reboot-btn:active { background: #e68900; }
     </style>
 </head>
 <body>
@@ -961,6 +1021,7 @@ WEB_INTERFACE = '''
             Logged in as <strong id="username">User</strong>
         </div>
         <button class="logout-btn" onclick="logout()">LOGOUT</button>
+        <button class="reboot-btn" onclick="rebootPi()">REBOOT</button>
 
         <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
         
@@ -1108,7 +1169,7 @@ WEB_INTERFACE = '''
             
             fetch(url, { method: 'POST' })
                 .then(r => r.json())
-                .then(data => {
+                .then data => {
                     btn.disabled = false;
                     if (data.status === 'success') {
                         isRecording = !isRecording;
@@ -1232,8 +1293,8 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
+                .then r => r.json())
+                .then data => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
                     } else {
@@ -1293,6 +1354,33 @@ WEB_INTERFACE = '''
                 .catch(err => {
                     alert('Logout error: ' + err);
                     window.location.href = '/';
+                });
+        }
+
+        function rebootPi() {
+            if (!confirm('Are you sure you want to reboot the Raspberry Pi?')) return;
+            const btn = document.querySelector('.reboot-btn');
+            btn.disabled = true;
+            btn.textContent = 'REBOOTING...';
+            fetch('/reboot', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        document.getElementById('status').textContent = 'Status: ' + data.message;
+                        setTimeout(() => {
+                            btn.textContent = 'REBOOT';
+                            btn.disabled = false;
+                        }, 10000);
+                    } else {
+                        alert('Error: ' + data.message);
+                        btn.textContent = 'REBOOT';
+                        btn.disabled = false;
+                    }
+                })
+                .catch(err => {
+                    alert('Reboot error: ' + err);
+                    btn.textContent = 'REBOOT';
+                    btn.disabled = false;
                 });
         }
 
