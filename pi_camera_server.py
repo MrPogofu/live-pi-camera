@@ -29,6 +29,13 @@ recording = False
 recording_lock = threading.Lock()
 stream_active = False
 
+# --- Add these globals for frame grabbing ---
+latest_frame = None
+latest_frame_lock = threading.Lock()
+frame_grabber_thread = None
+frame_grabber_running = False
+# --------------------------------------------
+
 # Default settings
 stream_config = {
     'width': 640,
@@ -101,15 +108,48 @@ def init_camera():
         
         stream_active = True
         print("Camera initialized successfully")
+        # --- Start frame grabber after camera is started ---
+        start_frame_grabber()
     except Exception as e:
         print(f"Error initializing camera: {e}")
         stream_active = False
         camera = None
 
+def start_frame_grabber():
+    """Start a background thread to always grab the latest frame from the camera."""
+    global frame_grabber_thread, frame_grabber_running, camera, latest_frame
+
+    def grabber():
+        global frame_grabber_running, camera, latest_frame
+        frame_grabber_running = True
+        while frame_grabber_running and camera is not None:
+            try:
+                frame = camera.capture_array()
+                with latest_frame_lock:
+                    latest_frame = frame
+            except Exception as e:
+                print(f"Frame grabber error: {e}")
+                time.sleep(0.1)
+        frame_grabber_running = False
+
+    # Stop any previous grabber
+    stop_frame_grabber()
+    if camera is not None:
+        frame_grabber_thread = threading.Thread(target=grabber, daemon=True)
+        frame_grabber_thread.start()
+
+def stop_frame_grabber():
+    """Stop the background frame grabber thread."""
+    global frame_grabber_running, frame_grabber_thread
+    frame_grabber_running = False
+    if frame_grabber_thread is not None:
+        frame_grabber_thread.join(timeout=1)
+    frame_grabber_thread = None
+
 def generate_frames():
-    """Generate MJPEG frames for streaming"""
-    global stream_active, camera
-    
+    """Generate MJPEG frames for streaming (always serve the latest frame)."""
+    global stream_active, camera, latest_frame
+
     # Try to initialize camera if needed
     if not stream_active or camera is None:
         print("Camera not active, initializing...")
@@ -139,27 +179,31 @@ def generate_frames():
                     time.sleep(frame_delay - time_since_last)
                 
                 last_frame_time = time.time()
-                
-                # Capture frame as numpy array
-                frame = camera.capture_array()
-                
-                # Encode to JPEG with quality 70 for balance
+
+                # --- Serve the latest frame only ---
+                with latest_frame_lock:
+                    frame = latest_frame.copy() if latest_frame is not None else None
+
+                if frame is None:
+                    # No frame available yet, send blank
+                    blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
+                    time.sleep(0.1)
+                    continue
+
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                
                 if not ret:
                     continue
-                
-                error_count = 0  # Reset error count on success
+
+                error_count = 0
                 frame_bytes = buffer.tobytes()
-                
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                       
+
             except Exception as e:
                 error_count += 1
-                print(f"Frame capture error ({error_count}): {e}")
-                
-                # If too many errors, try reinitializing
+                print(f"Frame serve error ({error_count}): {e}")
                 if error_count > 5:
                     print("Too many frame errors, attempting camera reinit...")
                     try:
@@ -170,10 +214,9 @@ def generate_frames():
                         pass
                     init_camera()
                     error_count = 0
-                
                 time.sleep(0.1)
                 continue
-                
+
     except GeneratorExit:
         print("Stream client disconnected")
     except Exception as e:
@@ -235,7 +278,8 @@ def start_recording():
                 camera.stop()
             except Exception as e:
                 print(f"Error stopping camera before reconfigure: {e}")
-            
+            # --- Stop frame grabber before reconfiguring camera ---
+            stop_frame_grabber()
             time.sleep(1)  # Longer pause for high-res switching
             
             try:
@@ -352,7 +396,8 @@ def stop_recording():
                 camera.close()
             except Exception as e:
                 print(f"Camera close error: {e}")
-            
+            # --- Stop frame grabber before closing camera ---
+            stop_frame_grabber()
             camera = None
             time.sleep(1)  # Give hardware time to fully reset
 
@@ -1420,4 +1465,5 @@ if __name__ == '__main__':
         print("\nShutting down...")
         if camera:
             camera.stop()
+        stop_frame_grabber()
         print("Server stopped")
