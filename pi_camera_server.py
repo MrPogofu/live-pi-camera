@@ -561,6 +561,19 @@ def update_record_settings():
     
     return jsonify({'status': 'success', 'settings': record_config})
 
+@app.route('/reboot', methods=['POST'])
+@require_login
+def reboot():
+    try:
+        # Optionally, prevent reboot while recording
+        if recording:
+            return jsonify({'status': 'error', 'message': 'Cannot reboot while recording'})
+        # Respond before rebooting to avoid client disconnect
+        threading.Thread(target=lambda: (time.sleep(1), os.system('sudo reboot')), daemon=True).start()
+        return jsonify({'status': 'success', 'message': 'Rebooting Raspberry Pi...'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
 LOGIN_INTERFACE = '''
 <!DOCTYPE html>
 <html>
@@ -781,10 +794,11 @@ WEB_INTERFACE = '''
             object-fit: contain;
             width: 100%;
         }
-        @media (max-width: 768px) {
+        @media (min-width: 750px) {
             #stream {
                 width: 640px;
             }
+        }
         .controls {
             margin-top: 15px;
             display: flex;
@@ -955,6 +969,16 @@ WEB_INTERFACE = '''
             color: #aaa;
             font-size: 12px;
         }
+        .reboot-btn {
+            background: #ff9800;
+            color: white;
+            font-size: 14px;
+            padding: 10px 15px;
+            position: absolute;
+            top: 10px;
+            right: 110px;
+        }
+        .reboot-btn:active { background: #e68900; }
     </style>
 </head>
 <body>
@@ -963,6 +987,7 @@ WEB_INTERFACE = '''
             Logged in as <strong id="username">User</strong>
         </div>
         <button class="logout-btn" onclick="logout()">LOGOUT</button>
+        <button class="reboot-btn" onclick="rebootPi()">REBOOT</button>
 
         <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
         
@@ -1310,6 +1335,38 @@ WEB_INTERFACE = '''
                     fps: parseInt(recordFps)
                 })
             });
+        }
+
+        function rebootPi() {
+            if (isRecording) {
+                alert('Cannot reboot while recording');
+                return;
+            }
+            if (!confirm('Are you sure you want to reboot the Raspberry Pi?')) {
+                return;
+            }
+            const btn = document.querySelector('.reboot-btn');
+            btn.disabled = true;
+            btn.textContent = 'REBOOTING...';
+            fetch('/reboot', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        document.getElementById('status').textContent = 'Status: Rebooting...';
+                        setTimeout(() => {
+                            document.getElementById('status').textContent = 'Status: Pi is rebooting. Please wait ~30s then refresh this page.';
+                        }, 2000);
+                    } else {
+                        alert('Error: ' + data.message);
+                        btn.disabled = false;
+                        btn.textContent = 'REBOOT';
+                    }
+                })
+                .catch(err => {
+                    alert('Reboot error: ' + err);
+                    btn.disabled = false;
+                    btn.textContent = 'REBOOT';
+                });
         }
 
         function logout() {
