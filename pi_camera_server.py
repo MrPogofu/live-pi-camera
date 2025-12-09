@@ -70,50 +70,58 @@ def require_login(f):
     decorated_function.__name__ = f.__name__
     return decorated_function
 
-def init_camera():
-    global camera, stream_active
-    try:
-        # Always stop and release previous camera if exists
-        if camera is not None:
-            try:
-                camera.stop()
-                camera.close()
-            except Exception as e:
-                print(f"Camera stop/close error during re-init: {e}")
-            camera = None
-            stream_active = False
-            time.sleep(1)  # Give hardware time to fully reset
+# --- New global for camera initialization status ---
+camera_initializing = False
+camera_init_lock = threading.Lock()
 
-        print("Initializing camera...")
-        camera = Picamera2()
-        
-        # Use video configuration with framerate control
-        config = camera.create_video_configuration(
-            main={"size": (stream_config['width'], stream_config['height']), 
-                  "format": "RGB888"},
-            controls={"FrameRate": stream_config['fps']}
-        )
-        
-        print(f"Camera config: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
-        camera.configure(config)
-        
-        # Set auto exposure and auto white balance
-        camera.set_controls({
-            "AeEnable": True,
-            "AwbEnable": True
-        })
-        
-        camera.start()
-        time.sleep(2)
-        
-        stream_active = True
-        print("Camera initialized successfully")
-        # --- Start frame grabber after camera is started ---
-        start_frame_grabber()
-    except Exception as e:
-        print(f"Error initializing camera: {e}")
-        stream_active = False
-        camera = None
+def init_camera():
+    global camera, stream_active, camera_initializing
+    with camera_init_lock:
+        camera_initializing = True
+        try:
+            # Always stop and release previous camera if exists
+            if camera is not None:
+                try:
+                    camera.stop()
+                    camera.close()
+                except Exception as e:
+                    print(f"Camera stop/close error during re-init: {e}")
+                camera = None
+                stream_active = False
+                time.sleep(1)  # Give hardware time to fully reset
+
+            print("Initializing camera...")
+            camera = Picamera2()
+            
+            # Use video configuration with framerate control
+            config = camera.create_video_configuration(
+                main={"size": (stream_config['width'], stream_config['height']), 
+                      "format": "RGB888"},
+                controls={"FrameRate": stream_config['fps']}
+            )
+            
+            print(f"Camera config: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
+            camera.configure(config)
+            
+            # Set auto exposure and auto white balance
+            camera.set_controls({
+                "AeEnable": True,
+                "AwbEnable": True
+            })
+            
+            camera.start()
+            time.sleep(2)
+            
+            stream_active = True
+            print("Camera initialized successfully")
+            # --- Start frame grabber after camera is started ---
+            start_frame_grabber()
+        except Exception as e:
+            print(f"Error initializing camera: {e}")
+            stream_active = False
+            camera = None
+        finally:
+            camera_initializing = False
 
 def start_frame_grabber():
     """Start a background thread to always grab the latest frame from the camera."""
@@ -148,13 +156,19 @@ def stop_frame_grabber():
 
 def generate_frames():
     """Generate MJPEG frames for streaming (always serve the latest frame)."""
-    global stream_active, camera, latest_frame
+    global stream_active, camera, latest_frame, camera_initializing
 
     # Try to initialize camera if needed
     if not stream_active or camera is None:
         print("Camera not active, initializing...")
-        init_camera()
-    
+        if not camera_initializing:
+            threading.Thread(target=init_camera, daemon=True).start()
+        # Wait for camera to finish initializing (max 5s)
+        for _ in range(50):
+            if not camera_initializing and camera is not None:
+                break
+            time.sleep(0.1)
+
     if not stream_active or camera is None:
         print("Camera not available for streaming")
         # Return a blank frame to prevent HTML error response
@@ -440,7 +454,8 @@ def status():
     return jsonify({
         'recording': recording,
         'stream_active': stream_active,
-        'camera_ready': camera is not None,
+        'camera_ready': camera is not None and not camera_initializing,
+        'camera_initializing': camera_initializing,
         'stream_config': stream_config,
         'record_config': record_config
     })
