@@ -29,12 +29,8 @@ recording = False
 recording_lock = threading.Lock()
 stream_active = False
 
-# --- Add these globals for frame grabbing ---
-latest_frame = None
-latest_frame_lock = threading.Lock()
-frame_grabber_thread = None
-frame_grabber_running = False
-# --------------------------------------------
+# Add a lock for camera access to allow concurrent stream/record
+camera_access_lock = threading.Lock()
 
 # Default settings
 stream_config = {
@@ -70,14 +66,9 @@ def require_login(f):
     decorated_function.__name__ = f.__name__
     return decorated_function
 
-# --- New global for camera initialization status ---
-camera_initializing = False
-camera_init_lock = threading.Lock()
-
 def init_camera():
-    global camera, stream_active, camera_initializing
-    with camera_init_lock:
-        camera_initializing = True
+    global camera, stream_active
+    with camera_access_lock:
         try:
             # Always stop and release previous camera if exists
             if camera is not None:
@@ -114,61 +105,20 @@ def init_camera():
             
             stream_active = True
             print("Camera initialized successfully")
-            # --- Start frame grabber after camera is started ---
-            start_frame_grabber()
         except Exception as e:
             print(f"Error initializing camera: {e}")
             stream_active = False
             camera = None
-        finally:
-            camera_initializing = False
-
-def start_frame_grabber():
-    """Start a background thread to always grab the latest frame from the camera."""
-    global frame_grabber_thread, frame_grabber_running, camera, latest_frame
-
-    def grabber():
-        global frame_grabber_running, camera, latest_frame
-        frame_grabber_running = True
-        while frame_grabber_running and camera is not None:
-            try:
-                frame = camera.capture_array()
-                with latest_frame_lock:
-                    latest_frame = frame
-            except Exception as e:
-                print(f"Frame grabber error: {e}")
-                time.sleep(0.1)
-        frame_grabber_running = False
-
-    # Stop any previous grabber
-    stop_frame_grabber()
-    if camera is not None:
-        frame_grabber_thread = threading.Thread(target=grabber, daemon=True)
-        frame_grabber_thread.start()
-
-def stop_frame_grabber():
-    """Stop the background frame grabber thread."""
-    global frame_grabber_running, frame_grabber_thread
-    frame_grabber_running = False
-    if frame_grabber_thread is not None:
-        frame_grabber_thread.join(timeout=1)
-    frame_grabber_thread = None
 
 def generate_frames():
-    """Generate MJPEG frames for streaming (always serve the latest frame)."""
-    global stream_active, camera, latest_frame, camera_initializing
+    """Generate MJPEG frames for streaming"""
+    global stream_active, camera
 
     # Try to initialize camera if needed
     if not stream_active or camera is None:
         print("Camera not active, initializing...")
-        if not camera_initializing:
-            threading.Thread(target=init_camera, daemon=True).start()
-        # Wait for camera to finish initializing (max 5s)
-        for _ in range(50):
-            if not camera_initializing and camera is not None:
-                break
-            time.sleep(0.1)
-
+        init_camera()
+    
     if not stream_active or camera is None:
         print("Camera not available for streaming")
         # Return a blank frame to prevent HTML error response
@@ -183,6 +133,11 @@ def generate_frames():
     last_frame_time = 0
     error_count = 0
     
+    # FPS counter
+    frame_count = 0
+    fps = 0
+    last_fps_time = time.time()
+
     try:
         while True:
             try:
@@ -193,31 +148,38 @@ def generate_frames():
                     time.sleep(frame_delay - time_since_last)
                 
                 last_frame_time = time.time()
-
-                # --- Serve the latest frame only ---
-                with latest_frame_lock:
-                    frame = latest_frame.copy() if latest_frame is not None else None
-
-                if frame is None:
-                    # No frame available yet, send blank
-                    blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
-                    time.sleep(0.1)
-                    continue
-
+                
+                # Capture frame as numpy array
+                frame = camera.capture_array()
+                
+                # Encode to JPEG with quality 70 for balance
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                
                 if not ret:
                     continue
+                
+                # FPS calculation
+                frame_count += 1
+                now = time.time()
+                if now - last_fps_time >= 1.0:
+                    fps = frame_count / (now - last_fps_time)
+                    frame_count = 0
+                    last_fps_time = now
 
-                error_count = 0
+                # Draw FPS on frame
+                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+                
+                error_count = 0  # Reset error count on success
                 frame_bytes = buffer.tobytes()
+                
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
+                       
             except Exception as e:
                 error_count += 1
-                print(f"Frame serve error ({error_count}): {e}")
+                print(f"Frame capture error ({error_count}): {e}")
+                
+                # If too many errors, try reinitializing
                 if error_count > 5:
                     print("Too many frame errors, attempting camera reinit...")
                     try:
@@ -228,9 +190,10 @@ def generate_frames():
                         pass
                     init_camera()
                     error_count = 0
+                
                 time.sleep(0.1)
                 continue
-
+                
     except GeneratorExit:
         print("Stream client disconnected")
     except Exception as e:
@@ -287,65 +250,38 @@ def start_recording():
             print(f"Starting recording to {filename}")
             print(f"Recording settings: {record_config['width']}x{record_config['height']} @ {record_config['fps']}fps")
 
-            # Stop current camera and reconfigure for recording
-            try:
-                camera.stop()
-            except Exception as e:
-                print(f"Error stopping camera before reconfigure: {e}")
-            # --- Do NOT stop frame grabber here ---
-            time.sleep(1)  # Longer pause for high-res switching
+            # Instead of stopping the camera, use a new Picamera2 instance for recording
+            rec_camera = Picamera2()
+            video_config = rec_camera.create_video_configuration(
+                main={"size": (record_config['width'], record_config['height']),
+                      "format": "RGB888"},
+                controls={"FrameRate": record_config['fps']}
+            )
+            rec_camera.configure(video_config)
+            rec_camera.set_controls({
+                "AeEnable": True,
+                "AwbEnable": True
+            })
+            rec_camera.start()
+            time.sleep(2)
 
-            try:
-                # Configure camera with recording settings
-                video_config = camera.create_video_configuration(
-                    main={"size": (record_config['width'], record_config['height']),
-                          "format": "RGB888"},
-                    controls={"FrameRate": record_config['fps']}
-                )
-                camera.configure(video_config)
-            except Exception as e:
-                print(f"Error configuring camera: {e}")
-                raise
-
-            # Set auto exposure and white balance
-            try:
-                camera.set_controls({
-                    "AeEnable": True,
-                    "AwbEnable": True
-                })
-            except Exception as e:
-                print(f"Error setting controls: {e}")
-
-            try:
-                camera.start()
-            except Exception as e:
-                print(f"Error starting camera: {e}")
-                raise
-
-            time.sleep(2)  # Let camera stabilize - important for high resolution
-
-            # Create encoder with appropriate bitrate
-            # Higher resolution needs higher bitrate
             if record_config['width'] >= 1920:
-                bitrate = 20000000  # 20Mbps for Full HD+
+                bitrate = 20000000
             elif record_config['width'] >= 1280:
-                bitrate = 15000000  # 15Mbps for HD
+                bitrate = 15000000
             else:
-                bitrate = 10000000  # 10Mbps for SD
+                bitrate = 10000000
 
-            try:
-                encoder = H264Encoder(bitrate=bitrate)
-                output = FileOutput(filename)
-                camera.start_recording(encoder, output)
-            except Exception as e:
-                print(f"Error starting encoder: {e}")
-                raise
+            encoder = H264Encoder(bitrate=bitrate)
+            output = FileOutput(filename)
+            rec_camera.start_recording(encoder, output)
+
+            # Store the recording camera instance globally for stop_recording
+            app.config['rec_camera'] = rec_camera
 
             recording = True
 
             print("Recording started successfully")
-            # --- Start frame grabber again in case camera was reconfigured ---
-            start_frame_grabber()
             return jsonify({
                 'status': 'success',
                 'filename': filename,
@@ -354,35 +290,29 @@ def start_recording():
         except Exception as e:
             print(f"Recording start error: {e}")
             recording = False
-            # Try to recover camera for streaming
             try:
-                if camera:
+                if 'rec_camera' in app.config:
                     try:
-                        camera.stop_recording()
+                        app.config['rec_camera'].stop_recording()
                     except:
                         pass
                     try:
-                        camera.stop()
+                        app.config['rec_camera'].stop()
                     except:
                         pass
                     try:
-                        camera.close()
+                        app.config['rec_camera'].close()
                     except:
                         pass
-                camera = None
+                    app.config.pop('rec_camera', None)
             except:
                 pass
-            time.sleep(1)
-            try:
-                init_camera()
-            except Exception as init_err:
-                print(f"Recovery init error: {init_err}")
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/stop_recording', methods=['POST'])
 @require_login
 def stop_recording():
-    global recording, camera
+    global recording
 
     with recording_lock:
         if not recording:
@@ -391,61 +321,45 @@ def stop_recording():
         try:
             print("Stopping recording")
 
-            # Stop recording first
-            try:
-                camera.stop_recording()
-            except Exception as e:
-                print(f"Error stopping recording: {e}")
-
-            # Stop camera
-            try:
-                camera.stop()
-            except Exception as e:
-                print(f"Error stopping camera: {e}")
+            rec_camera = app.config.get('rec_camera')
+            if rec_camera:
+                try:
+                    rec_camera.stop_recording()
+                except Exception as e:
+                    print(f"Error stopping recording: {e}")
+                try:
+                    rec_camera.stop()
+                except Exception as e:
+                    print(f"Error stopping camera: {e}")
+                try:
+                    rec_camera.close()
+                except Exception as e:
+                    print(f"Camera close error: {e}")
+                app.config.pop('rec_camera', None)
 
             recording = False
-            time.sleep(0.5)  # Brief pause
-
-            # Close and fully release camera
-            try:
-                camera.close()
-            except Exception as e:
-                print(f"Camera close error: {e}")
-            # --- Do NOT stop frame grabber here ---
-            camera = None
-            time.sleep(0.5)  # Shorter pause
-
-            # Restart camera with streaming configuration in background
-            threading.Thread(target=init_camera, daemon=True).start()
-
             print("Recording stopped successfully")
             return jsonify({'status': 'success'})
         except Exception as e:
             print(f"Recording stop error: {e}")
             recording = False
-            # Try to recover camera
             try:
-                if camera:
+                if 'rec_camera' in app.config:
                     try:
-                        camera.stop_recording()
+                        app.config['rec_camera'].stop_recording()
                     except:
                         pass
                     try:
-                        camera.stop()
+                        app.config['rec_camera'].stop()
                     except:
                         pass
                     try:
-                        camera.close()
+                        app.config['rec_camera'].close()
                     except:
                         pass
+                    app.config.pop('rec_camera', None)
             except Exception as e2:
                 print(f"Camera stop error during recovery: {e2}")
-            camera = None
-            time.sleep(1)
-            try:
-                threading.Thread(target=init_camera, daemon=True).start()
-            except Exception as e3:
-                print(f"Camera re-init error during recovery: {e3}")
             return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/status', methods=['GET'])
@@ -454,8 +368,7 @@ def status():
     return jsonify({
         'recording': recording,
         'stream_active': stream_active,
-        'camera_ready': camera is not None and not camera_initializing,
-        'camera_initializing': camera_initializing,
+        'camera_ready': camera is not None,
         'stream_config': stream_config,
         'record_config': record_config
     })
@@ -464,18 +377,18 @@ def status():
 @require_login
 def update_stream_settings():
     global stream_config, camera, stream_active
-    
+
     try:
         data = request.json
         stream_config['width'] = data.get('width', stream_config['width'])
         stream_config['height'] = data.get('height', stream_config['height'])
         stream_config['fps'] = data.get('fps', stream_config['fps'])
-        
+
         print(f"Updated stream settings: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
-        
-        # Reinitialize camera with new settings
+
+        # Reinitialize camera with new settings immediately
         init_camera()
-        
+
         return jsonify({'status': 'success', 'message': 'Stream settings updated'})
     except Exception as e:
         print(f"Error updating stream settings: {e}")
@@ -624,16 +537,6 @@ def delete_file(filename):
                     pass
         
         return jsonify({'status': 'success', 'message': 'File deleted'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
-
-@app.route('/reboot', methods=['POST'])
-@require_login
-def reboot_pi():
-    try:
-        # Respond before rebooting to avoid client disconnect
-        threading.Thread(target=lambda: (time.sleep(1), os.system('sudo reboot'))).start()
-        return jsonify({'status': 'success', 'message': 'Rebooting Raspberry Pi...'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
@@ -830,7 +733,7 @@ LOGIN_INTERFACE = '''
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, password })
             })
-            .then((r) => r.json())
+            .then(r => r.json())
             .then(data => {
                 if (data.status === 'success') {
                     window.location.href = '/';
@@ -881,39 +784,18 @@ WEB_INTERFACE = '''
         .container {
             max-width: 720px;
             padding: 10px;
-            position: relative; /* Ensure absolute children are positioned correctly */
+            position: relative;
         }
         #stream {
             width: 640px;
             height: 480px;
+            max-width: 100%;
+            max-height: 480px;
             display: block;
             border: 2px solid #333;
             border-radius: 8px;
             background: #1a1a1a;
-            min-height: 240px;
             object-fit: contain;
-            position: relative;
-            z-index: 1;
-        }
-        .fps-label {
-            position: absolute;
-            top: 18px;
-            left: 18px;
-            background: rgba(0,0,0,0.7);
-            color: #4CAF50;
-            font-size: 18px;
-            font-family: monospace;
-            padding: 4px 12px;
-            border-radius: 8px;
-            z-index: 2;
-            pointer-events: none;
-            user-select: none;
-        }
-        .stream-wrapper {
-            position: relative;
-            width: 640px;
-            height: 480px;
-            margin: 0 auto;
         }
         .controls {
             margin-top: 15px;
@@ -1076,7 +958,6 @@ WEB_INTERFACE = '''
             position: absolute;
             top: 10px;
             right: 10px;
-            z-index: 10;
         }
         .logout-btn:active { background: #c82333; }
         .user-info {
@@ -1085,20 +966,30 @@ WEB_INTERFACE = '''
             left: 10px;
             color: #aaa;
             font-size: 12px;
-            z-index: 10;
         }
         .reboot-btn {
-            position: absolute;
-            top: 10px;
-            right: 110px;
             background: #ff9800;
             color: white;
             font-size: 14px;
             padding: 10px 15px;
+            position: absolute;
+            top: 10px;
+            right: 110px;
             border-radius: 8px;
-            z-index: 10;
         }
         .reboot-btn:active { background: #e68900; }
+        .fps-counter {
+            position: absolute;
+            top: 60px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            color: #0f0;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 15px;
+            font-family: monospace;
+            z-index: 10;
+        }
     </style>
 </head>
 <body>
@@ -1107,12 +998,10 @@ WEB_INTERFACE = '''
             Logged in as <strong id="username">User</strong>
         </div>
         <button class="logout-btn" onclick="logout()">LOGOUT</button>
-        <button class="reboot-btn" onclick="rebootPi()">REBOOT</button>
+        <button class="reboot-btn" onclick="rebootPi()">REBOOT PI</button>
+        <span class="fps-counter" id="fpsCounter">FPS: --</span>
 
-        <div class="stream-wrapper">
-            <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
-            <div class="fps-label" id="fpsLabel">FPS: --</div>
-        </div>
+        <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
         
         <div class="controls">
             <button id="recordBtn" class="record-btn" onclick="toggleRecording()">
@@ -1188,57 +1077,39 @@ WEB_INTERFACE = '''
     <script>
         let isRecording = false;
         let cameraReady = false;
-        // --- FPS calculation workaround ---
+
+        // --- FPS Counter ---
         let lastFrameTime = null;
-        let fps = 0;
-        let fpsSamples = [];
-        let lastFrameCount = 0;
-        let frameCounter = 0;
-        const fpsLabel = document.getElementById('fpsLabel');
+        let frameTimes = [];
+        const fpsCounter = document.getElementById('fpsCounter');
         const streamImg = document.getElementById('stream');
-
-        // MJPEG <img> load event is unreliable, so use a timer to reload the stream and count frames
-        function reloadStream() {
-            streamImg.src = '{{ url_for("video_feed") }}?' + new Date().getTime();
-        }
-
-        // Count frames by using a hidden <img> that loads the stream and fires load events
-        // But for now, just try to update FPS on each reload
-        streamImg.addEventListener('load', function() {
+        streamImg.onload = function() {
             const now = performance.now();
-            if (lastFrameTime !== null) {
-                const dt = now - lastFrameTime;
-                if (dt > 0 && dt < 2000) {
-                    const currentFps = 1000 / dt;
-                    fpsSamples.push(currentFps);
-                    if (fpsSamples.length > 10) fpsSamples.shift();
-                    const avgFps = fpsSamples.reduce((a, b) => a + b, 0) / fpsSamples.length;
-                    fps = avgFps;
-                    fpsLabel.textContent = 'FPS: ' + Math.round(fps);
-                }
+            if (lastFrameTime) {
+                frameTimes.push(now - lastFrameTime);
+                if (frameTimes.length > 20) frameTimes.shift();
+                const avg = frameTimes.reduce((a,b)=>a+b,0)/frameTimes.length;
+                fpsCounter.textContent = 'FPS: ' + (1000/avg).toFixed(1);
             }
             lastFrameTime = now;
-        });
+        };
 
-        // Periodically reload the stream to force load events (simulate frame updates)
-        setInterval(() => {
-            if (!isRecording) {
-                reloadStream();
-            }
-        }, 1000); // Reload every second
-
-        // If no frame for 2 seconds, show FPS: --
-        setInterval(() => {
-            if (lastFrameTime && (performance.now() - lastFrameTime > 2000)) {
-                fpsLabel.textContent = 'FPS: --';
-            }
-        }, 500);
+        // --- Reboot Pi ---
+        function rebootPi() {
+            if (!confirm('Reboot Raspberry Pi?')) return;
+            fetch('/reboot', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    alert(data.message || 'Rebooting...');
+                })
+                .catch(err => alert('Reboot error: ' + err));
+        }
 
         // Load current settings on page load
         function loadCurrentSettings() {
             fetch('/status')
-                .then((r) => r.json())
-                .then((data) => {
+                .then(r => r.json())
+                .then(data => {
                     cameraReady = data.camera_ready;
                     
                     // Update stream settings
@@ -1253,8 +1124,12 @@ WEB_INTERFACE = '''
                     
                     // Update initial status
                     updateStatusDisplay(data);
+
+                    // --- Keep stream image size fixed ---
+                    streamImg.style.width = "640px";
+                    streamImg.style.height = "480px";
                 })
-                .catch((err) => {
+                .catch(err => {
                     console.log('Failed to load settings:', err);
                     document.getElementById('status').textContent = 'Status: Waiting for camera...';
                     document.getElementById('status').classList.remove('error');
@@ -1265,7 +1140,7 @@ WEB_INTERFACE = '''
             const status = document.getElementById('status');
             
             if (data.recording) {
-                status.textContent = 'Status: Recording...';
+                status.textContent = 'Status: Recording... (stream paused)';
                 status.classList.remove('error');
             } else if (data.camera_ready) {
                 status.textContent = 'Status: Ready';
@@ -1302,8 +1177,8 @@ WEB_INTERFACE = '''
             const url = isRecording ? '/stop_recording' : '/start_recording';
             
             fetch(url, { method: 'POST' })
-                .then((r) => r.json())
-                .then((data) => {
+                .then(r => r.json())
+                .then data => {
                     btn.disabled = false;
                     if (data.status === 'success') {
                         isRecording = !isRecording;
@@ -1314,7 +1189,7 @@ WEB_INTERFACE = '''
                         document.getElementById('status').classList.add('error');
                     }
                 })
-                .catch((err) => {
+                .catch(err => {
                     btn.disabled = false;
                     alert('Error: ' + err);
                     document.getElementById('status').textContent = 'Status: Connection error';
@@ -1330,17 +1205,15 @@ WEB_INTERFACE = '''
             if (isRecording) {
                 btn.textContent = 'STOP RECORDING';
                 btn.classList.add('recording');
-                status.textContent = 'Status: Recording...';
-                // Show FPS label while recording (stream not paused)
-                fpsLabel.style.visibility = 'visible';
+                status.textContent = 'Status: Recording... (stream paused)';
             } else {
                 btn.textContent = 'START RECORDING';
                 btn.classList.remove('recording');
                 status.textContent = 'Status: Ready';
-                fpsLabel.style.visibility = 'visible';
+                
                 // Reload stream after recording stops
                 setTimeout(() => {
-                    reloadStream();
+                    document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
                 }, 1000);
             }
         }
@@ -1376,8 +1249,8 @@ WEB_INTERFACE = '''
             list.innerHTML = '<div class="empty-message">Loading recordings...</div>';
             
             fetch('/list_recordings')
-                .then((r) => r.json())
-                .then((data) => {
+                .then(r => r.json())
+                .then(data => {
                     if (data.status === 'success') {
                         if (data.recordings.length === 0) {
                             list.innerHTML = '<div class="empty-message">No recordings found</div>';
@@ -1405,7 +1278,7 @@ WEB_INTERFACE = '''
                         list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
                     }
                 })
-                .catch((err) => {
+                .catch(err => {
                     list.innerHTML = '<div class="empty-message">Error loading recordings</div>';
                 });
         }
@@ -1429,15 +1302,15 @@ WEB_INTERFACE = '''
             }
             
             fetch(`/delete/${filename}`, { method: 'POST' })
-                .then((r) => r.json())
-                .then((data) => {
+                .then r => r.json())
+                .then data => {
                     if (data.status === 'success') {
                         loadRecordings(); // Refresh list
                     } else {
                         alert('Error: ' + data.message);
                     }
                 })
-                .catch((err) => alert('Error: ' + err));
+                .catch(err => alert('Error: ' + err));
         }
 
         function saveSettings() {
@@ -1464,6 +1337,9 @@ WEB_INTERFACE = '''
                 setTimeout(() => {
                     document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
                     status.textContent = 'Status: Stream settings applied';
+                    // --- Keep stream image size fixed ---
+                    streamImg.style.width = "640px";
+                    streamImg.style.height = "480px";
                 }, 1500);
             });
 
@@ -1493,41 +1369,14 @@ WEB_INTERFACE = '''
                 });
         }
 
-        function rebootPi() {
-            if (!confirm('Are you sure you want to reboot the Raspberry Pi?')) return;
-            const btn = document.querySelector('.reboot-btn');
-            btn.disabled = true;
-            btn.textContent = 'REBOOTING...';
-            fetch('/reboot', {method: 'POST'})
-                .then((r) => r.json())
-                .then((data) => {
-                    if (data.status === 'success') {
-                        document.getElementById('status').textContent = 'Status: ' + data.message;
-                        setTimeout(() => {
-                            btn.textContent = 'REBOOT';
-                            btn.disabled = false;
-                        }, 10000);
-                    } else {
-                        alert('Error: ' + data.message);
-                        btn.textContent = 'REBOOT';
-                        btn.disabled = false;
-                    }
-                })
-                .catch((err) => {
-                    alert('Reboot error: ' + err);
-                    btn.textContent = 'REBOOT';
-                    btn.disabled = false;
-                });
-        }
-
         // Display username
         document.getElementById('username').textContent = 'User';
 
         // Check status periodically
         setInterval(() => {
             fetch('/status')
-                .then((r) => r.json())
-                .then((data) => {
+                .then(r => r.json())
+                .then(data => {
                     cameraReady = data.camera_ready;
                     
                     if (data.recording !== isRecording) {
@@ -1537,7 +1386,7 @@ WEB_INTERFACE = '''
                         updateStatusDisplay(data);
                     }
                 })
-                .catch((err) => {
+                .catch(err => {
                     console.log('Status check failed:', err);
                 });
         }, 1000);
@@ -1556,5 +1405,4 @@ if __name__ == '__main__':
         print("\nShutting down...")
         if camera:
             camera.stop()
-        stop_frame_grabber()
         print("Server stopped")

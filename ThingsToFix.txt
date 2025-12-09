@@ -1,0 +1,6 @@
+// All issues below have been fixed in pi_camera_server.py:
+// - Needs raspberry pi reboot button
+// - Stream settings don't get applied
+// - Stream FPS counter
+// - Stream shouldn't pause during recording
+// - Stream image should stay the same size no matter the resolution
