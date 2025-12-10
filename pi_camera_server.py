@@ -30,8 +30,8 @@ stream_active = False
 
 # Default settings
 stream_config = {
-    'width': 640,
-    'height': 480,
+    'width': 320,
+    'height': 240,
     'fps': 30
 }
 
@@ -1012,9 +1012,18 @@ WEB_INTERFACE = '''
             <div class="setting-group">
                 <label>Resolution</label>
                 <select id="streamRes">
+                    <option value="192,144">192x144 (Super Low Latency)</option>
                     <option value="320,240">320x240 (Low Latency)</option>
-                    <option value="640,480" selected>640x480 (Balanced)</option>
-                    <option value="800,600">800x600 (High Quality)</option>
+                    <option value="424,240">424x240 (16:9 Low Latency)</option>
+                    <option value="480,320">480x320 (Compact 3:2)</option>
+                    <option value="640,360">640x360 (16:9 Balanced)</option>
+                    <option value="640,480" selected>640x480 (4:3 Balanced)</option>
+                    <option value="800,450">800x450 (16:9 High Quality)</option>
+                    <option value="800,600">800x600 (4:3 High Quality)</option>
+                    <option value="960,540">960x540 (qHD 16:9)</option>
+                    <option value="1024,768">1024x768 (4:3 Sharp)</option>
+                    <option value="1280,720">1280x720 (HD Stream)</option>
+                    <option value="1280,960">1280x960 (4:3 HD Stream)</option>
                 </select>
                 <div class="info-text">Lower resolution = less latency</div>
             </div>
@@ -1032,18 +1041,26 @@ WEB_INTERFACE = '''
                 <label>Resolution</label>
                 <select id="recordRes">
                     <option value="640,480">640x480 (SD)</option>
-                    <option value="1280,720">1280x720 (HD)</option>
-                    <option value="1920,1080" selected>1920x1080 (Full HD)</option>
-                    <option value="2592,1944">2592x1944 (5MP Max)</option>
+                    <option value="1024,768">1024x768 (4:3 Medium)</option>
+                    <option value="1280,720">1280x720 (HD 16:9)</option>
+                    <option value="1280,960">1280x960 (HD 4:3)</option>
+                    <option value="1600,1200">1600x1200 (2MP 4:3)</option>
+                    <option value="1920,1080" selected>1920x1080 (Full HD 16:9)</option>
+                    <option value="2048,1152">2048x1152 (Oversampled 16:9)</option>
+                    <option value="2592,1458">2592x1458 (Max 16:9 Crop)</option>
+                    <option value="2592,1080">2592x1080 (Super-Wide 2.40:1)</option>
+                    <option value="2592,1944">2592x1944 (5MP Full Sensor 4:3)</option>
                 </select>
                 <div class="info-text">Recording resolution (independent of stream)</div>
             </div>
             <div class="setting-group">
                 <label>FPS</label>
                 <select id="recordFps">
-                    <option value="24">24 FPS</option>
-                    <option value="30" selected>30 FPS</option>
-                    <option value="60">60 FPS</option>
+                    <option value="15">15 FPS (Low Light)</option>
+                    <option value="24">24 FPS (Cinematic)</option>
+                    <option value="30" selected>30 FPS (Standard)</option>
+                    <option value="45">45 FPS (Fast Smooth)</option>
+                    <option value="60">60 FPS (High Motion)</option>
                 </select>
             </div>
 
