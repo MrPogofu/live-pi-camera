@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi Zero Camera Server for FTC Robot
+Raspberry Pi Zero Camera Server for FTC Robot - Low Latency Version
 Install: pip3 install picamera2 flask opencv-python
 Run: python3 camera_server.py
 """
@@ -28,17 +28,19 @@ recording = False
 recording_lock = threading.Lock()
 stream_active = False
 
-# Latest frame storage for streaming
+# Latest frame storage for streaming - NOW WITH TIMESTAMP
 latest_frame = None
+latest_frame_timestamp = 0
 latest_frame_lock = threading.Lock()
 frame_grabber_thread = None
 frame_grabber_running = False
 
-# Default settings
+# Default settings - LOWER DEFAULTS FOR BETTER LATENCY
 stream_config = {
     'width': 320,
     'height': 240,
-    'fps': 30
+    'fps': 30,
+    'quality': 50  # Lower quality = smaller files = less latency
 }
 
 record_config = {
@@ -106,7 +108,7 @@ def init_camera():
         
         stream_active = True
         print("Camera initialized successfully")
-        start_frame_grabber()  # <-- Start frame grabber after camera is ready
+        start_frame_grabber()
     except Exception as e:
         print(f"Error initializing camera: {e}")
         stream_active = False
@@ -114,7 +116,7 @@ def init_camera():
 
 def frame_grabber():
     """Continuously grab the latest frame from the camera."""
-    global latest_frame, frame_grabber_running, camera, stream_active
+    global latest_frame, latest_frame_timestamp, frame_grabber_running, camera, stream_active
     frame_delay = 1.0 / stream_config['fps']
     while frame_grabber_running:
         if not stream_active or camera is None:
@@ -122,10 +124,12 @@ def frame_grabber():
             continue
         try:
             frame = camera.capture_array()
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            # Use configured quality setting
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, stream_config['quality']])
             if ret:
                 with latest_frame_lock:
                     latest_frame = buffer.tobytes()
+                    latest_frame_timestamp = time.time()
         except Exception as e:
             print(f"Frame grabber error: {e}")
             time.sleep(0.1)
@@ -146,8 +150,9 @@ def stop_frame_grabber():
         frame_grabber_thread = None
 
 def generate_frames():
-    """Serve the most recent MJPEG frame for streaming, always as up-to-date as possible."""
-    global stream_active, camera, latest_frame
+    """Serve the most recent MJPEG frame for streaming with aggressive latency reduction."""
+    global stream_active, camera, latest_frame, latest_frame_timestamp
+    
     if not stream_active or camera is None:
         print("Camera not active, initializing...")
         init_camera()
@@ -160,19 +165,29 @@ def generate_frames():
         return
 
     frame_delay = 1.0 / stream_config['fps']
+    last_sent_timestamp = 0
+    
     try:
         while True:
             with latest_frame_lock:
                 frame_bytes = latest_frame
-            if frame_bytes is not None:
+                frame_timestamp = latest_frame_timestamp
+            
+            # CRITICAL: Only send frame if it's newer than last sent
+            # This prevents sending old frames and reduces buffering
+            if frame_bytes is not None and frame_timestamp > last_sent_timestamp:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                last_sent_timestamp = frame_timestamp
             else:
-                # If no frame yet, send blank
-                blank = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18l\xf6\x00\x00\x00\x00IEND\xaeB`\x82'
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/png\r\n\r\n' + blank + b'\r\n')
-            time.sleep(frame_delay)
+                # Frame not ready or already sent - send minimal data to keep connection alive
+                # This prevents browser buffering while waiting for new frames
+                time.sleep(frame_delay * 0.5)  # Check more frequently than frame rate
+                continue
+            
+            # Small delay to match target framerate
+            time.sleep(frame_delay * 0.8)  # Slightly faster to prevent backup
+            
     except GeneratorExit:
         print("Stream client disconnected")
     except Exception as e:
@@ -206,8 +221,14 @@ def index():
 @app.route('/video_feed')
 @require_login
 def video_feed():
-    return Response(generate_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    # Add cache control headers to prevent buffering
+    response = Response(generate_frames(),
+                       mimetype='multipart/x-mixed-replace; boundary=frame')
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    response.headers['X-Accel-Buffering'] = 'no'  # Disable nginx buffering if present
+    return response
 
 @app.route('/start_recording', methods=['POST'])
 @require_login
@@ -344,7 +365,7 @@ def stop_recording():
                 print(f"Camera close error: {e}")
             camera = None
             stream_active = False
-            stop_frame_grabber()  # <-- Stop frame grabber before re-init
+            stop_frame_grabber()
             time.sleep(1)
             init_camera()
             print("Recording stopped successfully")
@@ -512,8 +533,10 @@ def update_stream_settings():
         stream_config['height'] = int(data['height'])
     if 'fps' in data:
         stream_config['fps'] = int(data['fps'])
+    if 'quality' in data:
+        stream_config['quality'] = int(data['quality'])
     
-    print(f"Stream settings updated: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps")
+    print(f"Stream settings updated: {stream_config['width']}x{stream_config['height']} @ {stream_config['fps']}fps, quality={stream_config['quality']}")
     print("Restarting camera to apply new stream settings...")
     # Force camera re-init to apply new settings immediately
     try:
@@ -528,7 +551,7 @@ def update_stream_settings():
                 print(f"Error closing camera before re-init: {e}")
         camera = None
         stream_active = False
-        stop_frame_grabber()  # <-- Stop frame grabber before re-init
+        stop_frame_grabber()
         time.sleep(1)
         init_camera()
     except Exception as e:
@@ -969,6 +992,16 @@ WEB_INTERFACE = '''
             right: 110px;
         }
         .reboot-btn:active { background: #e68900; }
+        .latency-indicator {
+            position: absolute;
+            top: 60px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px 12px;
+            border-radius: 5px;
+            font-size: 12px;
+            color: #4CAF50;
+        }
     </style>
 </head>
 <body>
@@ -978,6 +1011,7 @@ WEB_INTERFACE = '''
         </div>
         <button class="logout-btn" onclick="logout()">LOGOUT</button>
         <button class="reboot-btn" onclick="rebootPi()">REBOOT</button>
+        <div class="latency-indicator" id="latencyIndicator">Latency: --ms</div>
 
         <img id="stream" src="{{ url_for('video_feed') }}" alt="Camera Stream" onerror="handleStreamError()">
         
@@ -998,32 +1032,40 @@ WEB_INTERFACE = '''
         </div>
 
         <div class="settings-panel" id="settingsPanel">
-            <h3>Stream Settings</h3>
+            <h3>Stream Settings (Affects Latency)</h3>
             <div class="setting-group">
                 <label>Resolution</label>
                 <select id="streamRes">
-                    <option value="192,144">192x144 (Super Low Latency)</option>
-                    <option value="320,240">320x240 (Low Latency)</option>
+                    <option value="192,144">192x144 (Ultra Low Latency)</option>
+                    <option value="320,240" selected>320x240 (Low Latency - Recommended)</option>
                     <option value="424,240">424x240 (16:9 Low Latency)</option>
                     <option value="480,320">480x320 (Compact 3:2)</option>
                     <option value="640,360">640x360 (16:9 Balanced)</option>
-                    <option value="640,480" selected>640x480 (4:3 Balanced)</option>
+                    <option value="640,480">640x480 (4:3 Balanced)</option>
                     <option value="800,450">800x450 (16:9 High Quality)</option>
                     <option value="800,600">800x600 (4:3 High Quality)</option>
-                    <option value="960,540">960x540 (qHD 16:9)</option>
-                    <option value="1024,768">1024x768 (4:3 Sharp)</option>
-                    <option value="1280,720">1280x720 (HD Stream)</option>
-                    <option value="1280,960">1280x960 (4:3 HD Stream)</option>
                 </select>
-                <div class="info-text">Lower resolution = less latency</div>
+                <div class="info-text">⚠️ Lower resolution = much less latency</div>
             </div>
             <div class="setting-group">
                 <label>FPS</label>
                 <select id="streamFps">
-                    <option value="15">15 FPS</option>
-                    <option value="24">24 FPS</option>
-                    <option value="30" selected>30 FPS</option>
+                    <option value="15">15 FPS (Lowest Bandwidth)</option>
+                    <option value="24">24 FPS (Good Balance)</option>
+                    <option value="30" selected>30 FPS (Smooth)</option>
                 </select>
+            </div>
+            <div class="setting-group">
+                <label>Quality (JPEG Compression)</label>
+                <select id="streamQuality">
+                    <option value="30">30% (Lowest Latency)</option>
+                    <option value="40">40% (Very Low Latency)</option>
+                    <option value="50" selected>50% (Low Latency - Recommended)</option>
+                    <option value="60">60% (Balanced)</option>
+                    <option value="70">70% (Good Quality)</option>
+                    <option value="80">80% (High Quality)</option>
+                </select>
+                <div class="info-text">⚠️ Lower quality = smaller files = less latency</div>
             </div>
 
             <h3 style="margin-top: 20px;">Recording Settings</h3>
@@ -1055,7 +1097,7 @@ WEB_INTERFACE = '''
             </div>
 
             <div class="info-text" style="margin: 15px 0;">
-                Camera uses automatic exposure and white balance for best quality.
+                💡 For lowest latency on bad connections: Use 192x144 or 320x240, 30% quality, 15-24 FPS
             </div>
 
             <button class="save-btn" onclick="saveSettings()">SAVE SETTINGS</button>
@@ -1072,6 +1114,27 @@ WEB_INTERFACE = '''
     <script>
         let isRecording = false;
         let cameraReady = false;
+        let lastFrameTime = Date.now();
+
+        // Monitor stream for latency
+        const streamImg = document.getElementById('stream');
+        streamImg.addEventListener('load', function() {
+            const now = Date.now();
+            const latency = now - lastFrameTime;
+            lastFrameTime = now;
+            
+            const indicator = document.getElementById('latencyIndicator');
+            if (latency < 200) {
+                indicator.style.color = '#4CAF50'; // Green
+                indicator.textContent = `Latency: ${latency}ms (Good)`;
+            } else if (latency < 500) {
+                indicator.style.color = '#ff9800'; // Orange
+                indicator.textContent = `Latency: ${latency}ms (OK)`;
+            } else {
+                indicator.style.color = '#dc3545'; // Red
+                indicator.textContent = `Latency: ${latency}ms (High)`;
+            }
+        });
 
         // Load current settings on page load
         function loadCurrentSettings() {
@@ -1084,6 +1147,7 @@ WEB_INTERFACE = '''
                     const streamRes = `${data.stream_config.width},${data.stream_config.height}`;
                     document.getElementById('streamRes').value = streamRes;
                     document.getElementById('streamFps').value = data.stream_config.fps;
+                    document.getElementById('streamQuality').value = data.stream_config.quality;
                     
                     // Update record settings
                     const recordRes = `${data.record_config.width},${data.record_config.height}`;
@@ -1175,8 +1239,6 @@ WEB_INTERFACE = '''
                 btn.classList.remove('recording');
                 status.textContent = 'Status: Restarting camera...';
                 
-                // Wait for camera to reinitialize, then reload stream
-                // Poll status until camera is ready
                 let retries = 0;
                 const maxRetries = 10;
                 const recheckInterval = setInterval(() => {
@@ -1187,7 +1249,6 @@ WEB_INTERFACE = '''
                                 clearInterval(recheckInterval);
                                 status.textContent = 'Status: Reconnecting stream...';
                                 
-                                // Now reload the stream
                                 setTimeout(() => {
                                     document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
                                     status.textContent = 'Status: Ready';
@@ -1215,9 +1276,7 @@ WEB_INTERFACE = '''
             const panel = document.getElementById('settingsPanel');
             const recordingsPanel = document.getElementById('recordingsPanel');
             
-            // Close recordings if open
             recordingsPanel.classList.remove('active');
-            
             panel.classList.toggle('active');
         }
 
@@ -1225,13 +1284,11 @@ WEB_INTERFACE = '''
             const panel = document.getElementById('recordingsPanel');
             const settingsPanel = document.getElementById('settingsPanel');
             
-            // Close settings if open
             settingsPanel.classList.remove('active');
             
             const wasActive = panel.classList.contains('active');
             panel.classList.toggle('active');
             
-            // Load recordings when opening
             if (!wasActive) {
                 loadRecordings();
             }
@@ -1298,7 +1355,7 @@ WEB_INTERFACE = '''
                 .then(r => r.json())
                 .then(data => {
                     if (data.status === 'success') {
-                        loadRecordings(); // Refresh list
+                        loadRecordings();
                     } else {
                         alert('Error: ' + data.message);
                     }
@@ -1309,10 +1366,10 @@ WEB_INTERFACE = '''
         function saveSettings() {
             const streamRes = document.getElementById('streamRes').value.split(',');
             const streamFps = document.getElementById('streamFps').value;
+            const streamQuality = document.getElementById('streamQuality').value;
             const recordRes = document.getElementById('recordRes').value.split(',');
             const recordFps = document.getElementById('recordFps').value;
 
-            // Show saving message
             const status = document.getElementById('status');
             status.textContent = 'Status: Applying settings...';
             status.classList.remove('error');
@@ -1323,10 +1380,10 @@ WEB_INTERFACE = '''
                 body: JSON.stringify({
                     width: parseInt(streamRes[0]),
                     height: parseInt(streamRes[1]),
-                    fps: parseInt(streamFps)
+                    fps: parseInt(streamFps),
+                    quality: parseInt(streamQuality)
                 })
             }).then(() => {
-                // Reload stream with new settings
                 setTimeout(() => {
                     document.getElementById('stream').src = '{{ url_for("video_feed") }}?' + new Date().getTime();
                     status.textContent = 'Status: Stream settings applied';
@@ -1391,10 +1448,8 @@ WEB_INTERFACE = '''
                 });
         }
 
-        // Display username
         document.getElementById('username').textContent = 'User';
 
-        // Check status periodically
         setInterval(() => {
             fetch('/status')
                 .then(r => r.json())
@@ -1425,7 +1480,7 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=8080, threaded=True, debug=False)
     except KeyboardInterrupt:
         print("\nShutting down...")
-        stop_frame_grabber()  # <-- Stop frame grabber on shutdown
+        stop_frame_grabber()
         if camera:
             camera.stop()
         print("Server stopped")
